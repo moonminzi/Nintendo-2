@@ -1,0 +1,17 @@
+diff --git a/dm/ios/Sources/main.m b/dm/ios/Sources/main.m
+index 7cd198e..8cc75e8 100644
+--- a/dm/ios/Sources/main.m
++++ b/dm/ios/Sources/main.m
+@@ -168,6 +168,12 @@ static int boot_env(void) {
+     }
+     setenv("DM_ENV_FILE_KEYS", [from_file componentsJoinedByString:@" "].UTF8String, 1);   // the launcher keeps what an env file set (LauncherSettings.swift)
+     setenv("DM_ENV_LAUNCH_KEYS", [from_launch componentsJoinedByString:@" "].UTF8String, 1);   // and what the launch environment set (docs/frontends.md, Saved choices)
++    // A RomFS overlay folder in Documents (a fan translation's romfs files, put there with the Files app): Documents/patch, its files taking precedence over the game files (DM_ROMFS_OVERLAY,
++    // hle_fs.c). env.txt cannot name it, since the app's container path changes with each install; a DM_ROMFS_OVERLAY an env file or the launch set wins
++    if (!getenv("DM_ROMFS_OVERLAY")) {
++        BOOL isdir = NO; NSString *ov = [doc stringByAppendingPathComponent:@"patch"];
++        if ([NSFileManager.defaultManager fileExistsAtPath:ov isDirectory:&isdir] && isdir) { setenv("DM_ROMFS_OVERLAY", ov.fileSystemRepresentation, 1); fprintf(stderr, "boot: RomFS overlay Documents/patch\n"); }
++    }
+     front_hud_env();   // an env file's DM_METAL_HUD; nothing in this process makes a Metal device before startGame (front_ios.m), which applies the launcher's
+     // Game language (nn::oe::GetDesiredLanguage, hle_oe.c): the one the IPA was packed with (the NSP script's LANGUAGE / --language → DMLanguage in Info.plist), unless an env file sets DM_LANG
+     // (or the launcher, which replaces this default before the game starts)
