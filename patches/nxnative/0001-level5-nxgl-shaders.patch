@@ -1,0 +1,54 @@
+diff --git a/dm/gfx/tools/shader_split.py b/dm/gfx/tools/shader_split.py
+index 384bbbd..d376047 100644
+--- a/dm/gfx/tools/shader_split.py
++++ b/dm/gfx/tools/shader_split.py
+@@ -30,6 +30,7 @@
+ #   · PKZ (PlatinumGames, Bayonetta 3): shader objects (VSO / PSO / CSO / HSO / DSO, a control section and a code area each) in the DAT archives of the PKZ entries (Oodle Kraken, decoded by the
+ #       game's own decoder in the Mac host), see pkz_entries, pgdat_members and pg_shader
+ #   · CRA (Camelot, Mario Tennis Fever): BNSH in the FSHA, VFXB and SARC members of the NARC containers in rom:/42, its files scrambled and listed only in the NRO the game decodes at run time, see cra.py and cra_jobs
++#   · NXGL (Level-5, Yo-kai Watch 4): HBH1 shader binaries, each one stage's code area and control section in an NXGL record, loose and in a CPK, see nxgl_shaders
+ #   · CPK (CRI's file system, Bayonetta 2): BNSH files ('.vso' / '.pso') in the PlatinumGames DAT archives of the CPK entries (CRILAYLA entries, cpk.py), see cpk_jobs
+ #       NieR:Automata's DAT members instead prefix length-delimited NVN code and control sections with a binding table (pg_sized_shader)
+ #   · HNSHV002 (Needle, Persona 5 Royal): NVN section descriptors in the shader containers embedded in main and the GSC files of its CPK archives, see needle_shaders
+@@ -1904,6 +1905,24 @@ def phyre_shaders(d, label):
+     return out
+ 
+ 
++HBH1, NXGL = b'HBH1', b'NXGL'
++def nxgl_shaders(d, label):
++    """Level-5's shader binaries (Yo-kai Watch 4: '.vsb' / '.fsb' / '.gsb' / '.esb' / '.csb' files, loose in /data/nx/shader and in shader.cpk, 1,893 of them): an HBH1 file with the program's
++    reflection tables and one NXGL record {magic 'NXGL', u32 version 1, u32 code offset, u32 code length, u32 control offset, u32 control length} (offsets from the record) holding one stage's code area
++    and control section. Graphics code areas carry the 0x12345678 header; compute ones (SDK 7) none, so the stage is glslc_stage's"""
++    out = []
++    for m in re.finditer(NXGL, d):
++        i = m.start()
++        if i & 3 or i + 0x18 > len(d): continue
++        v, co, cn, to, tn = struct.unpack_from('<5I', d, i + 4)
++        if v != 1 or i + co + cn > len(d) or i + to + tn > len(d): continue
++        code, ctl = d[i + co:i + co + cn], d[i + to:i + to + tn]
++        st = glslc_stage(ctl, code) if ctl[:4] == CTL_MAGIC else None
++        why = check(label, st, ctl, code) if st else 'no stage'
++        if why: print(f'[RED] {label} NXGL @{i:#x}: {why}; left out', flush=True); continue
++        out.append((f'{label}#NXGL@{i:#x}', st, ctl, code))
++    return out
++
+ def raw_shaders(d, label, known=()):
+     """Control sections in main that are in no GLSLC output and no BNSH file: a shader compiled offline whose control section and code area the code hands to nvnShaderData itself (Advance Wars 1+2:
+     Re-Boot Camp, Unity 2020.2 with Bink 2: the movie player's 32: 2 vertex, 22 pixel and 8 compute shaders; without them its movies drew white). Most are 0x20-byte records in data {code area
+@@ -2722,6 +2741,7 @@ def scan_blob(d, label, out, depth=0, left=None):
+         import cra
+         for i, m in enumerate(cra.narc_members(d, label)): scan_blob(cra.undo(m), f'{label}/{i}', out, depth + 1)
+         return
++    if d[:4] == HBH1 and NXGL in d: out.extend(nxgl_shaders(d, label)); return
+     if d[:4] == b'BAHS': out.extend(bahs_shaders(d, label)); return
+     if d[:4] == b'NDSR': out.extend(ndsr_shaders(d, label)); return
+     if d[:4] == b'NDVE': out.extend(ndve_shaders(d, label)); return
+@@ -2765,7 +2785,7 @@ def pixel_input_cover(shaders):
+         k = min(ins, key=lambda k: (-len(ins[k] & left), k)); cover.append(k); left -= ins[k]
+     return cover
+ 
+-SINGLE_STAGE = ('#GLSLC@', '#VIPER', '#UE', '#MTSPK@', '#MGFX@', '#NLG', '#PGSO', '#RAW@', '#TFXO@', '#NEEDLE@', '#SNOWDROP@', '#PHYRE@', '#SUMO@', '#NVNSH@')   # sources whose every shader is a program of one stage: GLSLC outputs, Unreal's shader records, MT Framework's shader package (BNSH variations, Unity programs, MSHD and SDF pair theirs);
++SINGLE_STAGE = ('#NXGL@', '#GLSLC@', '#VIPER', '#UE', '#MTSPK@', '#MGFX@', '#NLG', '#PGSO', '#RAW@', '#TFXO@', '#NEEDLE@', '#SNOWDROP@', '#PHYRE@', '#SUMO@', '#NVNSH@')   # sources whose every shader is a program of one stage: GLSLC outputs, Unreal's shader records, MT Framework's shader package (BNSH variations, Unity programs, MSHD and SDF pair theirs);
+ # Unreal Engine 3's shader caches (ue3_shaders, '#UE3@'); MonoGame's effects, whose passes may name no vertex shader and keep the one bound (Celeste: 10 of its 13 effects draw through SpriteBatch's vertex shader, which is in main); Next Level Games'
+ # archives (Luigi's Mansion 3 makes 5,317 programs of one stage each at boot); PlatinumGames' shader objects (Bayonetta 3: one stage each, pg_shader); control sections loose in main
+ # (Advance Wars 1+2: Re-Boot Camp's Bink shaders, raw_shaders), which no file pairs; YEBIS's effect file (tfxo_shaders); and Sumo's Ninty_NX descriptors and NVNsh records, one stage
