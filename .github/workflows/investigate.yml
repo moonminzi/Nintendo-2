@@ -39,7 +39,7 @@ jobs:
       - name: nxnative·도구 준비
         run: |
           git clone https://github.com/seedds/nxnative.git nxnative && git -C nxnative checkout "${{ inputs.nxnative_ref }}"
-          brew install zstd sevenzip
+          brew install xcodegen zstd glslang sevenzip
           brew install --cask dotnet-sdk || true
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/pip" install -r nxnative/.github/requirements/tools.txt
@@ -59,10 +59,11 @@ jobs:
           find . -mindepth 2 -type f \( -iname '*.nsp' -o -iname '*.xci' -o -iname '*.nsz' -o -iname '*.xcz' \) -exec mv {} . \;
           ls -la; df -h /
 
-      - name: 추출·분석 보고서(survey)
+      - name: 전체 추출 (셰이더 단계에서 멈추는 건 정상)
         run: |
+          # --survey-only 는 게임 데이터를 풀지 않아서, 일반 빌드를 돌려 추출본(RomFS.img)을 남긴다
           "$RUNNER_TEMP/venv/bin/python" -u nxnative/scripts/build_ipa_from_nsp.py "$RUNNER_TEMP/game" \
-            -k "$RUNNER_TEMP/keys/prod.keys" --survey-only --progress lines 2>&1 | tee "$RUNNER_TEMP/survey.log" || true
+            -k "$RUNNER_TEMP/keys/prod.keys" --romfs separate --allow-other-metal --progress lines 2>&1 | tee "$RUNNER_TEMP/survey.log" || true
 
       - name: 키 삭제
         if: always()
@@ -71,13 +72,13 @@ jobs:
       - name: 게임 데이터 조사
         run: |
           out="$RUNNER_TEMP/inv"; mkdir -p "$out"
-          b=$(ls -d "$RUNNER_TEMP"/game/*_build | head -1)
-          echo "build: $b"; find "$b" -maxdepth 3 | head -80
+          b="$RUNNER_TEMP/game"
+          find "$b" -maxdepth 4 -not -path '*/romfs/*' | head -120
           "$RUNNER_TEMP/venv/bin/python" -u repo/tools/investigate.py "$PWD/nxnative" "$b" "$out" 2>&1 | tail -150 || true
           cp "$RUNNER_TEMP/survey.log" "$out/" || true
-          find "$RUNNER_TEMP/game" -path '*_survey/*' -type f -exec cp {} "$out/" \; || true
-          mkdir -p "$out/logs"; cp -R "$b/logs/." "$out/logs/" 2>/dev/null || true
-          find "$b" -maxdepth 4 > "$out/tree.txt"
+          find "$b" -path '*_survey/*.md' -type f -exec cp {} "$out/" \; || true
+          mkdir -p "$out/logs"; cp -R "$b"/*_build/logs/. "$out/logs/" 2>/dev/null || true
+          find "$b" -maxdepth 5 > "$out/tree.txt" || true
           gzip -k "$out/manifest.tsv" 2>/dev/null || true
           aws s3 cp --recursive "$out" "s3://$S3_BUCKET/site/investigate/run-${{ github.run_number }}/" --no-progress --exclude manifest.tsv
 
