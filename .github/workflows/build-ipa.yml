@@ -278,7 +278,7 @@ jobs:
             exit 0
           fi
           python3 "$RUNNER_TEMP/st.py" running "서명 요청 중"
-          payload=$(python3 -c 'import json,sys; print(json.dumps({"nago_api": "sign", "body": {"source": "s3:" + sys.argv[1], "bundle": "profile", "cert": 0}}))' "$key")
+          payload=$(python3 -c 'import json,sys; print(json.dumps({"nago_api": "sign", "body": {"source": "s3:" + sys.argv[1], "bundle": "keep", "cert": 0}}))' "$key")
           job=""
           if aws lambda invoke --region ap-northeast-2 --function-name nago-sign \
                --cli-binary-format raw-in-base64-out --payload "$payload" "$RUNNER_TEMP/sign.json" >/dev/null; then
