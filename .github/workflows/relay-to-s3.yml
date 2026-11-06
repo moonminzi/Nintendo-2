@@ -14,6 +14,9 @@
 # 진행률은 Actions 실행 페이지의 "..." 단계 로그에서 실시간으로 보입니다(curl 진행 막대).
 #
 # 실행: 5분마다 자동(schedule) / 수동(Run workflow) / repository_dispatch(type: relay-download).
+# 업로드 사이트가 "다 받으면 자동 빌드"를 예약해 두면(s3://<버킷>/site/autobuild.json),
+# 받을 링크·압축이 모두 끝난 뒤 이 워크플로우가 Build IPA를 시작하고 예약을 지운다.
+#
 # 필요한 저장소 시크릿: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
 name: Relay links to S3
 
@@ -30,6 +33,7 @@ concurrency:
 
 permissions:
   contents: read
+  actions: write   # 자동 빌드 예약이 있으면 Build IPA 를 시작(gh workflow run)
 
 jobs:
   relay:
@@ -158,3 +162,30 @@ jobs:
             cd "$work"; rm -rf "$d"; echo "::endgroup::"
           done <<< "$arcs"
           echo "끝"
+
+      - name: 예약된 자동 빌드 시작
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          if ! aws s3 cp "s3://$S3_BUCKET/site/autobuild.json" "$RUNNER_TEMP/auto.json" --no-progress >/dev/null 2>&1; then
+            echo "자동 빌드 예약 없음"; exit 0
+          fi
+          listing="$(aws s3api list-objects-v2 --bucket "$S3_BUCKET" --prefix "$PREFIX" --output json)"
+          left=$(printf '%s' "$listing" | jq '[(.Contents // [])[].Key | select(test("\\.(url|rar|7z)$"; "i"))] | length')
+          if [ "$left" != "0" ]; then echo "아직 받을 링크·압축 ${left}개 — 다 받은 뒤 시작"; exit 0; fi
+          games=$(printf '%s' "$listing" | jq '[(.Contents // [])[].Key | select(test("\\.(nsp|xci|nsz|xcz|zip)$"; "i"))] | length')
+          if [ "$games" = "0" ]; then
+            echo "::warning::빌드할 게임 파일이 없어 자동 빌드 예약을 취소합니다"
+            aws s3 rm "s3://$S3_BUCKET/site/autobuild.json"; exit 0
+          fi
+          romfs=$(jq -r '.romfs // "bundle"' "$RUNNER_TEMP/auto.json")
+          lang=$(jq -r '.language // "ko"' "$RUNNER_TEMP/auto.json")
+          case "$romfs" in bundle|separate) ;; *) romfs=bundle ;; esac
+          case "$lang" in *[!A-Za-z-]*) lang=ko ;; esac
+          aws s3 rm "s3://$S3_BUCKET/site/autobuild.json"
+          gh workflow run build-ipa.yml --repo "$GITHUB_REPOSITORY" --ref main \
+            -f romfs="$romfs" -f language="$lang" -f auto_sign=true
+          printf '{"state": "queued", "phase": "빌드 시작 요청됨 (러너 기다리는 중)", "updated": %s, "started": %s}' "$(date +%s)" "$(date +%s)" \
+            | aws s3 cp - "s3://$S3_BUCKET/site/build.json" --content-type application/json
+          echo "Build IPA 시작 요청 (romfs=$romfs, language=$lang)"
