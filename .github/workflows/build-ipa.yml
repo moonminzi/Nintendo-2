@@ -35,9 +35,18 @@ on:
         description: 러너의 Xcode가 27.2가 아닐 때도 셰이더 빌드 진행 (--allow-other-metal)
         type: boolean
         default: true
+      auto_sign:
+        description: 빌드가 끝나면 nago-sign 서명기로 바로 서명 시작
+        type: boolean
+        default: true
 
 permissions:
   contents: write
+
+# 빌드끼리는 동시에 돌지 않고 줄을 선다(버킷 uploads/ 를 같이 쓰므로)
+concurrency:
+  group: build-ipa
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -45,6 +54,7 @@ jobs:
     timeout-minutes: 360
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
+      S3_BUCKET: nintendo-games-417178828989
     steps:
       - name: 시크릿 확인
         env:
@@ -60,6 +70,52 @@ jobs:
           GAME_URL="${GAME_URL_INPUT:-$GAME_URL_SECRET}"
           if [ -n "$GAME_URL" ]; then echo "입력한 링크로 빌드합니다"; else echo "버킷 uploads/ 의 파일로 빌드합니다"; fi
 
+      - name: AWS 자격증명 설정
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      # 진행 상태를 s3://<버킷>/site/build.json 에 남긴다(업로드 사이트가 읽어서 보여 준다)
+      #   python3 st.py <state|-> <phase|-> [key=value ...] [logfile=경로 → 마지막 4줄]
+      - name: 상태 기록 준비
+        env:
+          IN_ROMFS: ${{ inputs.romfs }}
+          IN_LANG: ${{ inputs.language }}
+        run: |
+          cat > "$RUNNER_TEMP/st.py" <<'PY'
+          import json, os, re, subprocess, sys, time
+          p = os.path.join(os.environ["RUNNER_TEMP"], "status.json")
+          try:
+              s = json.load(open(p))
+          except Exception:
+              rid = os.environ["GITHUB_RUN_ID"]
+              s = {"run_id": rid, "run_number": int(os.environ["GITHUB_RUN_NUMBER"]),
+                   "url": "%s/%s/actions/runs/%s" % (os.environ["GITHUB_SERVER_URL"], os.environ["GITHUB_REPOSITORY"], rid),
+                   "started": time.time(), "romfs": os.environ.get("IN_ROMFS", ""), "language": os.environ.get("IN_LANG", "")}
+          a = sys.argv[1:]
+          if a and a[0] != "-":
+              s["state"] = a[0]
+          if len(a) > 1 and a[1] != "-":
+              s["phase"] = a[1]
+          for kv in a[2:]:
+              k, _, v = kv.partition("=")
+              if k == "logfile":
+                  try:
+                      lines = [re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", l).rstrip() for l in open(v, errors="replace").read().splitlines()]
+                      s["log"] = [l[-200:] for l in lines if l.strip()][-4:]
+                  except OSError:
+                      pass
+              else:
+                  s[k] = v
+          s["updated"] = time.time()
+          json.dump(s, open(p, "w"), ensure_ascii=False)
+          subprocess.run(["aws", "s3", "cp", p, "s3://%s/site/build.json" % os.environ["S3_BUCKET"], "--no-progress",
+                          "--content-type", "application/json"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+          PY
+          python3 "$RUNNER_TEMP/st.py" running "준비 중"
+
       - name: 디스크 공간 확보
         run: |
           df -h /
@@ -72,6 +128,7 @@ jobs:
 
       - name: Xcode 선택 (27.x 우선)
         run: |
+          python3 "$RUNNER_TEMP/st.py" running "Xcode·Metal 준비 중"
           pick=$(ls -d /Applications/Xcode_27*.app 2>/dev/null | sort -V | tail -1)
           [ -n "$pick" ] || pick=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | grep -v beta | sort -V | tail -1)
           [ -n "$pick" ] || pick=$(ls -d /Applications/Xcode_*.app 2>/dev/null | grep -v beta | sort -V | tail -1)
@@ -91,6 +148,7 @@ jobs:
 
       - name: 도구 설치
         run: |
+          python3 "$RUNNER_TEMP/st.py" running "도구 설치 중"
           brew install xcodegen zstd glslang sevenzip
           brew install --cask dotnet-sdk || true
           dotnet --version
@@ -98,13 +156,6 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/pip" install -r nxnative/.github/requirements/tools.txt
           "$RUNNER_TEMP/venv/bin/pip" install "backports.zstd; python_version < '3.14'"
-
-      - name: AWS 자격증명 설정
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
 
       - name: 게임과 키 준비
         env:
@@ -115,6 +166,7 @@ jobs:
           PREFIX: uploads/
         run: |
           set -euo pipefail
+          python3 "$RUNNER_TEMP/st.py" running "게임 파일 받는 중"
           GAME_URL="${GAME_URL_INPUT:-$GAME_URL_SECRET}"
           mkdir -p "$RUNNER_TEMP/keys" "$RUNNER_TEMP/game"
           printf '%s\n' "$PROD_KEYS" > "$RUNNER_TEMP/keys/prod.keys"
@@ -153,12 +205,22 @@ jobs:
 
       - name: IPA 빌드
         run: |
+          set -o pipefail
+          python3 "$RUNNER_TEMP/st.py" running "IPA 빌드 중 (nxnative)"
           args=(--romfs "${{ inputs.romfs }}" --no-keep-extracted --progress lines)
           [ -n "${{ inputs.language }}" ] && args+=(-l "${{ inputs.language }}")
           [ "${{ inputs.allow_other_metal }}" = "true" ] && args+=(--allow-other-metal)
           mkdir -p "$RUNNER_TEMP/out"
-          "$RUNNER_TEMP/venv/bin/python" nxnative/scripts/build_ipa_from_nsp.py "$RUNNER_TEMP/game" \
-            -k "$RUNNER_TEMP/keys/prod.keys" "${args[@]}"
+          # 빌드 로그 마지막 줄을 20초마다 사이트로 보낸다
+          log="$RUNNER_TEMP/build.log"; : > "$log"
+          ( while sleep 20; do python3 "$RUNNER_TEMP/st.py" - - "logfile=$log"; done ) &
+          tailer=$!
+          rc=0
+          "$RUNNER_TEMP/venv/bin/python" -u nxnative/scripts/build_ipa_from_nsp.py "$RUNNER_TEMP/game" \
+            -k "$RUNNER_TEMP/keys/prod.keys" "${args[@]}" 2>&1 | tee "$log" || rc=$?
+          kill "$tailer" 2>/dev/null || true
+          python3 "$RUNNER_TEMP/st.py" - - "logfile=$log"
+          [ "$rc" -eq 0 ] || exit "$rc"
           find "$RUNNER_TEMP/game" -maxdepth 1 -name '*.ipa' -exec mv {} "$RUNNER_TEMP/out/" \;
           ls -la "$RUNNER_TEMP/out"
 
@@ -175,13 +237,13 @@ jobs:
           retention-days: 3
           if-no-files-found: error
 
-      # GitHub 릴리스 첨부파일은 2GiB 미만만 허용된다. 게임 데이터를 포함한(bundle) IPA는 보통 그보다 크므로,
-      # 2GiB 이상이면 IPA를 S3 버킷 ipa/ 에 올리고 7일짜리 다운로드 링크를 릴리스 본문과 download-url.txt 에 넣는다.
-      - name: GitHub 릴리스로 발행 (nago-sign 서명기에서 바로 집어가도록)
+      # IPA는 크기와 상관없이 항상 S3 ipa/<태그>/ 에 올린다(업로드 사이트·서명기가 여기서 집어 간다).
+      # GitHub 릴리스 첨부는 2GiB 미만만 허용되므로, 그 이상이면 릴리스에는 7일짜리 다운로드 링크를 넣는다.
+      - name: IPA 올리기 · 릴리스 · 자동 서명
         if: success()
         env:
           GH_TOKEN: ${{ github.token }}
-          S3_BUCKET: nintendo-games-417178828989
+          AUTO_SIGN: ${{ inputs.auto_sign }}
         run: |
           set -euo pipefail
           ipa=$(ls "$RUNNER_TEMP"/out/*.ipa 2>/dev/null | head -1)
@@ -189,14 +251,15 @@ jobs:
           name=$(basename "$ipa")
           size=$(stat -f%z "$ipa")
           tag="ipa-${GITHUB_RUN_NUMBER}"
-          notes="서명 안 된 IPA입니다. nago-sign 서명기에서 본인 인증서로 재서명 후 설치하세요."
-          echo "릴리스 발행: $tag ← $name ($(( size / 1024 / 1024 )) MB)"
+          key="ipa/${tag}/${name}"
+          python3 "$RUNNER_TEMP/st.py" running "IPA 올리는 중 ($(( size / 1024 / 1024 )) MB)"
+          aws s3 cp "$ipa" "s3://$S3_BUCKET/$key" --no-progress
+          python3 "$RUNNER_TEMP/st.py" - - "ipa_key=$key"
+
+          notes="서명 안 된 IPA입니다. 업로드 사이트(또는 nago-sign 서명기)에서 서명 후 설치하세요."
           if [ "$size" -lt 2147483648 ]; then
             assets=("$ipa")
           else
-            key="ipa/${tag}/${name}"
-            echo "2GiB 이상이라 릴리스에 첨부할 수 없어 S3에 올립니다: s3://$S3_BUCKET/$key"
-            aws s3 cp "$ipa" "s3://$S3_BUCKET/$key" --no-progress
             url=$(aws s3 presign "s3://$S3_BUCKET/$key" --expires-in 604800)
             printf '%s\n' "$url" > "$RUNNER_TEMP/download-url.txt"
             assets=("$RUNNER_TEMP/download-url.txt")
@@ -207,7 +270,32 @@ jobs:
           fi
           gh release create "$tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY" \
             --title "Nintendo IPA ${tag}" --notes "$notes" \
-            || gh release upload "$tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+            || gh release upload "$tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber \
+            || echo "::warning::릴리스 발행 실패(IPA는 S3에 올라가 있음)"
+
+          if [ "$AUTO_SIGN" != "true" ]; then
+            python3 "$RUNNER_TEMP/st.py" done "빌드 완료"
+            exit 0
+          fi
+          python3 "$RUNNER_TEMP/st.py" running "서명 요청 중"
+          payload=$(python3 -c 'import json,sys; print(json.dumps({"nago_api": "sign", "body": {"source": "s3:" + sys.argv[1], "bundle": "profile", "cert": 0}}))' "$key")
+          job=""
+          if aws lambda invoke --region ap-northeast-2 --function-name nago-sign \
+               --cli-binary-format raw-in-base64-out --payload "$payload" "$RUNNER_TEMP/sign.json" >/dev/null; then
+            job=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("job", ""))' "$RUNNER_TEMP/sign.json" || true)
+          fi
+          if [ -n "$job" ]; then
+            printf '{"job": "%s", "key": "%s", "by": "build"}' "$job" "$key" \
+              | aws s3 cp - "s3://$S3_BUCKET/site/sign/${tag}.json" --content-type application/json
+            python3 "$RUNNER_TEMP/st.py" done "빌드 완료 · 서명 진행 중" "sign_job=$job"
+          else
+            echo "::warning::자동 서명 요청 실패: $(cat "$RUNNER_TEMP/sign.json" 2>/dev/null || true)"
+            python3 "$RUNNER_TEMP/st.py" done "빌드 완료 (자동 서명 실패 — 사이트에서 서명을 누르세요)"
+          fi
+
+      - name: 빌드 상태 마무리 (실패·취소)
+        if: failure() || cancelled()
+        run: python3 "$RUNNER_TEMP/st.py" "${{ job.status }}" - || true
 
       - name: 실패 시 로그 업로드
         if: failure()
