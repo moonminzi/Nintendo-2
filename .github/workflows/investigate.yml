@@ -9,6 +9,13 @@ on:
       nxnative_ref:
         description: nxnative 브랜치/태그/커밋
         default: main
+      dump:
+        description: "꺼내서 S3에 올릴 RomFS 경로(쉼표로 구분, 예 /data/nx/shader). 비우면 안 꺼냄"
+        default: ""
+      scan:
+        description: 전체 데이터 조사(시간 걸림)
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -74,7 +81,12 @@ jobs:
           out="$RUNNER_TEMP/inv"; mkdir -p "$out"
           b="$RUNNER_TEMP/game"
           find "$b" -maxdepth 4 -not -path '*/romfs/*' | head -120
-          "$RUNNER_TEMP/venv/bin/python" -u repo/tools/investigate.py "$PWD/nxnative" "$b" "$out" 2>&1 | tail -150 || true
+          if [ -n "${{ inputs.dump }}" ]; then
+            for img in "$b"/*_build/extract/*/RomFS.img; do
+              "$RUNNER_TEMP/venv/bin/python" -u repo/tools/dump_romfs.py "$PWD/nxnative" "$img" "$out/dump/$(basename "$(dirname "$img")")" "${{ inputs.dump }}" | tail -40
+            done
+          fi
+          [ "${{ inputs.scan }}" = "true" ] && "$RUNNER_TEMP/venv/bin/python" -u repo/tools/investigate.py "$PWD/nxnative" "$b" "$out" 2>&1 | tail -150 || true
           cp "$RUNNER_TEMP/survey.log" "$out/" || true
           find "$b" -path '*_survey/*.md' -type f -exec cp {} "$out/" \; || true
           mkdir -p "$out/logs"; cp -R "$b"/*_build/logs/. "$out/logs/" 2>/dev/null || true
