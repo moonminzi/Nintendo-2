@@ -39,6 +39,12 @@ on:
         description: 빌드가 끝나면 nago-sign 서명기로 바로 서명 시작
         type: boolean
         default: true
+      romfs_patch:
+        description: "게임 데이터 패치(xdelta, 예 한국어 패치) zip의 S3 키 (예 patch/yw4_korpatch_2.2.0.zip). 적용 결과를 patch.zip 으로 올림. 비우면 안 함"
+        default: ""
+      romfs_patch_password:
+        description: 패치 zip 비밀번호 (없으면 비움)
+        default: ""
 
 permissions:
   contents: write
@@ -320,6 +326,27 @@ jobs:
             echo "::warning::자동 서명 요청 실패: $(cat "$RUNNER_TEMP/sign.json" 2>/dev/null || true)"
             python3 "$RUNNER_TEMP/st.py" done "빌드 완료 (자동 서명 실패 — 사이트에서 서명을 누르세요)"
           fi
+
+      - name: 게임 데이터 패치 만들기 (patch.zip)
+        if: inputs.romfs_patch != ''
+        env:
+          PATCH_KEY: ${{ inputs.romfs_patch }}
+          PATCH_PW: ${{ inputs.romfs_patch_password }}
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/st.py" - "한국어 패치 적용 중"
+          brew install xdelta
+          img=$(ls "$RUNNER_TEMP"/game/*_build/extract/*/RomFS.img 2>/dev/null | head -1)
+          [ -n "$img" ] || { echo "::error::추출된 RomFS.img가 없습니다 (romfs=separate 로 빌드해야 남음)"; exit 1; }
+          w="$RUNNER_TEMP/rpatch"; mkdir -p "$w/src" "$w/out/patch"
+          aws s3 cp "s3://$S3_BUCKET/$PATCH_KEY" "$w/patch.zip" --no-progress
+          7zz x -y ${PATCH_PW:+-p"$PATCH_PW"} -o"$w/src" "$w/patch.zip" >/dev/null
+          "$RUNNER_TEMP/venv/bin/python" -u repo/tools/apply_xdelta.py "$PWD/nxnative" "$img" "$w/src" "$w/out/patch"
+          # 압축 안 함(cpk는 이미 압축돼 있음): 파일 앱에서 풀면 patch 폴더가 생긴다
+          (cd "$w/out" && zip -0 -r -q ../patch-out.zip patch)
+          ls -la "$w/patch-out.zip"
+          aws s3 cp "$w/patch-out.zip" "s3://$S3_BUCKET/ipa/ipa-${{ github.run_number }}/patch.zip" --no-progress
+          python3 "$RUNNER_TEMP/st.py" - "한국어 패치 올림"
 
       - name: 빌드 상태 마무리 (실패·취소)
         if: failure() || cancelled()
