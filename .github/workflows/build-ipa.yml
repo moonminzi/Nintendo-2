@@ -207,7 +207,9 @@ jobs:
         run: |
           set -o pipefail
           python3 "$RUNNER_TEMP/st.py" running "IPA 빌드 중 (nxnative)"
-          args=(--romfs "${{ inputs.romfs }}" --no-keep-extracted --progress lines)
+          args=(--romfs "${{ inputs.romfs }}" --progress lines)
+          # separate 는 게임 데이터(RomFS.img)를 따로 올려야 해서 추출본을 남긴다(nxnative가 separate 와 --no-keep-extracted 를 같이 쓰면 거부함)
+          [ "${{ inputs.romfs }}" = "separate" ] || args+=(--no-keep-extracted)
           [ -n "${{ inputs.language }}" ] && args+=(-l "${{ inputs.language }}")
           [ "${{ inputs.allow_other_metal }}" = "true" ] && args+=(--allow-other-metal)
           mkdir -p "$RUNNER_TEMP/out"
@@ -244,6 +246,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           AUTO_SIGN: ${{ inputs.auto_sign }}
+          ROMFS: ${{ inputs.romfs }}
         run: |
           set -euo pipefail
           ipa=$(ls "$RUNNER_TEMP"/out/*.ipa 2>/dev/null | head -1)
@@ -255,6 +258,20 @@ jobs:
           python3 "$RUNNER_TEMP/st.py" running "IPA 올리는 중 ($(( size / 1024 / 1024 )) MB)"
           aws s3 cp "$ipa" "s3://$S3_BUCKET/$key" --no-progress
           python3 "$RUNNER_TEMP/st.py" - - "ipa_key=$key"
+
+          # separate: 게임 데이터를 ipa/<태그>/romfs.img 로 올린다(아이패드에서 파일 앱으로 앱 폴더에 넣는다).
+          # 이름을 romfs.img 로 맞춰 두면 받은 파일을 이름 바꾸지 않고 그대로 옮기면 된다.
+          if [ "$ROMFS" = "separate" ]; then
+            img=$(find "$RUNNER_TEMP/game" -path '*_build/extract/*' -iname 'romfs.img' -type f 2>/dev/null | head -1)
+            if [ -n "$img" ]; then
+              isz=$(stat -f%z "$img")
+              python3 "$RUNNER_TEMP/st.py" running "게임 데이터 올리는 중 ($(( isz / 1024 / 1024 )) MB)"
+              aws s3 cp "$img" "s3://$S3_BUCKET/ipa/${tag}/romfs.img" --no-progress
+              python3 "$RUNNER_TEMP/st.py" - - "romfs_key=ipa/${tag}/romfs.img"
+            else
+              echo "::warning::separate 빌드인데 RomFS.img 를 찾지 못했습니다(게임 데이터를 따로 받을 수 없음)"
+            fi
+          fi
 
           notes="서명 안 된 IPA입니다. 업로드 사이트(또는 nago-sign 서명기)에서 서명 후 설치하세요."
           if [ "$size" -lt 2147483648 ]; then
