@@ -166,12 +166,12 @@ jobs:
         if: always()
         run: rm -rf "$RUNNER_TEMP/keys"
 
+      # archive: false → zip으로 묶지 않고 .ipa 파일 그대로 올린다(내려받으면 바로 .ipa, 아티팩트 이름 = 파일명)
       - name: IPA 업로드
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: ipa
           path: ${{ runner.temp }}/out/*.ipa
-          compression-level: 0
+          archive: false
           retention-days: 3
           if-no-files-found: error
 
