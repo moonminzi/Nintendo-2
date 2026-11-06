@@ -86,7 +86,7 @@ jobs:
 
       - name: 도구 설치
         run: |
-          brew install xcodegen zstd glslang unar
+          brew install xcodegen zstd glslang sevenzip
           brew install --cask dotnet-sdk || true
           dotnet --version
           python3 --version
@@ -105,11 +105,9 @@ jobs:
           printf '%s\n' "$PROD_KEYS" > "$RUNNER_TEMP/keys/prod.keys"
           cd "$RUNNER_TEMP/game"
           curl -fL --retry 3 -o download.bin "$GAME_URL"
-          if unzip -tq download.bin >/dev/null 2>&1; then
-            unzip -q download.bin && rm download.bin
-          elif lsar download.bin >/dev/null 2>&1; then
-            # rar(및 unar이 지원하는 7z 등) 압축 해제
-            unar -q -f -o . download.bin && rm download.bin
+          if 7zz l download.bin >/dev/null 2>&1; then
+            # zip / rar(RAR5 포함) / 7z 압축 해제
+            7zz x -y -o. download.bin && rm -f download.bin
           else
             ext=$(python3 -c "import sys,urllib.parse,os;print(os.path.splitext(urllib.parse.urlparse(sys.argv[1]).path)[1].lower() or '.nsp')" "$GAME_URL")
             mv download.bin "game$ext"

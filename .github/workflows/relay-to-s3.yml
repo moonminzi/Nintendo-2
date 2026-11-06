@@ -2,20 +2,19 @@
 # GitHub 러너가 대신 받아서 "실제 게임 파일"로 nintendo-games 버킷에 올립니다.
 #
 # 동작:
-#   s3://nintendo-games-417178828989/uploads/ 안의 *.url(링크 포인터)을 찾아
-#     1) 링크에서 파일을 내려받고
-#     2) zip/rar/7z 이면 .nsp/.xci/.nsz/.xcz 를 꺼내
-#     3) uploads/ 에 실제 파일로 올린 뒤
-#     4) 처리된 .url 포인터를 삭제합니다.
-#   다운로드/업로드에 실패하면 .url 을 지우지 않고 남겨 다음 실행에 재시도합니다.
+#   s3://nintendo-games-417178828989/uploads/ 를 정리합니다.
+#     1) *.url (링크 포인터): 링크에서 파일을 내려받고,
+#        rar/7z 이면 7-Zip(7zz, RAR5 지원)으로 .nsp/.xci/.nsz/.xcz 를 꺼내 올림.
+#        그 외(zip·게임파일)는 그대로 올림. 성공 시 .url 삭제.
+#     2) 버킷에 남은 *.rar / *.7z (직접 업로드분·과거분): 내려받아 풀고
+#        게임 파일로 올린 뒤 원본 압축 삭제.
+#   다운로드/해제에 실패하면 원본(.url 또는 압축)을 지우지 않고 다음 실행에 재시도합니다.
+#   다운로드가 200KB/s 미만으로 120초 이상 지속되면(=사실상 멈춤) 자동 중단하고 재시도로 넘깁니다.
 #
-# 실행 방법:
-#   - 5분마다 자동(schedule)
-#   - Actions → "Relay links to S3" → Run workflow (수동)
-#   - repository_dispatch (type: relay-download) — 나중에 Lambda가 즉시 트리거할 때 사용
+# 진행률은 Actions 실행 페이지의 "..." 단계 로그에서 실시간으로 보입니다(curl 진행 막대).
 #
+# 실행: 5분마다 자동(schedule) / 수동(Run workflow) / repository_dispatch(type: relay-download).
 # 필요한 저장소 시크릿: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
-#   (nintendo-games-417178828989 버킷에 Get/Put/Delete/List 권한 필요)
 name: Relay links to S3
 
 on:
@@ -35,13 +34,13 @@ permissions:
 jobs:
   relay:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     env:
       S3_BUCKET: nintendo-games-417178828989
       PREFIX: uploads/
     steps:
       - name: 도구 설치
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq unar jq
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq 7zip jq
 
       - name: 디스크 공간 확보
         run: |
@@ -58,50 +57,83 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-1
 
-      - name: 링크 받아서 S3로 올리기
+      - name: 링크/압축을 실제 게임 파일로 S3에 정리
         run: |
           set -uo pipefail
           B="$S3_BUCKET"; P="$PREFIX"
           work="$RUNNER_TEMP/relay"; mkdir -p "$work"
+          GAME='-iname *.nsp -o -iname *.xci -o -iname *.nsz -o -iname *.xcz'
 
+          # 파일 하나 처리: rar/7z면 풀어서 게임파일 업로드, 아니면 그대로 업로드.
+          # 사람이 읽는 로그는 stderr로, 업로드 개수만 stdout 마지막 줄로 반환.
+          process_file() {
+            local f="$1" name="$2" low up=0 g
+            low="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+            case "$low" in
+              *.rar|*.7z)
+                echo "압축 해제 중: $name" >&2
+                rm -rf ext && mkdir -p ext
+                if 7zz x -y -oext "$f" >&2; then
+                  while IFS= read -r -d '' g; do
+                    echo "업로드: $(basename "$g")" >&2
+                    aws s3 cp "$g" "s3://$B/$P$(basename "$g")" --no-progress >&2 && up=$((up+1))
+                  done < <(find ext -type f \( $GAME \) -print0)
+                else
+                  echo "::warning::압축 해제 실패: $name" >&2
+                fi
+                ;;
+              *)
+                echo "그대로 업로드: $name" >&2
+                aws s3 cp "$f" "s3://$B/$P$name" --no-progress >&2 && up=1
+                ;;
+            esac
+            echo "$up"
+          }
+
+          # 1) 링크(.url) 처리
           keys="$(aws s3api list-objects-v2 --bucket "$B" --prefix "$P" --output json \
                    | jq -r '(.Contents // []) | .[].Key | select(endswith(".url"))')"
-          if [ -z "${keys:-}" ]; then echo "처리할 링크(.url)가 없습니다"; exit 0; fi
-          echo "처리 대상:"; echo "$keys"
-
           while IFS= read -r key; do
             [ -n "$key" ] || continue
-            echo "::group::$key"
+            echo "::group::링크 $key"
             base="$(basename "$key")"; base="${base%.url}"
             url="$(aws s3 cp "s3://$B/$key" - 2>/dev/null | head -n1 | tr -d '\r\n')"
-            if [ -z "$url" ]; then echo "::warning::빈 링크, 건너뜀"; echo "::endgroup::"; continue; fi
-
+            if [ -z "$url" ]; then echo "::warning::빈 링크"; echo "::endgroup::"; continue; fi
             d="$(mktemp -d "$work/XXXXXX")"; cd "$d"
-            if ! curl -fL --retry 4 --retry-delay 3 -A "Mozilla/5.0" -o "$base" "$url"; then
-              echo "::warning::다운로드 실패 — .url 유지(다음 실행 재시도): $url"
-              cd "$work"; rm -rf "$d"; echo "::endgroup::"; continue
-            fi
-
-            uploaded=0
-            if lsar "$base" >/dev/null 2>&1; then
-              echo "압축 파일 감지 → 해제"
-              mkdir -p ext
-              unar -q -f -o ext "$base" && rm -f "$base"
-              while IFS= read -r -d '' f; do
-                echo "업로드: $(basename "$f")"
-                aws s3 cp "$f" "s3://$B/$P$(basename "$f")" --no-progress && uploaded=$((uploaded+1))
-              done < <(find ext -type f \( -iname '*.nsp' -o -iname '*.xci' -o -iname '*.nsz' -o -iname '*.xcz' \) -print0)
+            if curl -fL --retry 4 --retry-delay 3 --connect-timeout 30 \
+                    --speed-limit 204800 --speed-time 120 \
+                    -A "Mozilla/5.0" -o "$base" "$url"; then
+              n="$(process_file "$d/$base" "$base" | tail -n1)"
+              if [ "${n:-0}" -gt 0 ]; then
+                aws s3 rm "s3://$B/$key" && echo "완료: $base (게임파일 ${n}개, 링크 정리)"
+              else
+                echo "::warning::$base 처리 결과 없음 — .url 유지"
+              fi
             else
-              echo "단일 파일 업로드: $base"
-              aws s3 cp "$base" "s3://$B/$P$base" --no-progress && uploaded=1
+              echo "::warning::다운로드 실패/너무 느림 — .url 유지(다음 실행 재시도): $url"
             fi
-
-            if [ "$uploaded" -gt 0 ]; then
-              aws s3 rm "s3://$B/$key" && echo "완료: $base ($uploaded개 업로드, 링크 포인터 정리)"
-            else
-              echo "::warning::$base 에서 올릴 게임 파일(.nsp/.xci/.nsz/.xcz)을 못 찾음 — .url 유지"
-            fi
-            cd "$work"; rm -rf "$d"
-            echo "::endgroup::"
+            cd "$work"; rm -rf "$d"; echo "::endgroup::"
           done <<< "$keys"
+
+          # 2) 버킷에 남은 압축(.rar/.7z) 처리 (직접 업로드분·과거분)
+          arcs="$(aws s3api list-objects-v2 --bucket "$B" --prefix "$P" --output json \
+                   | jq -r '(.Contents // []) | .[].Key | select(test("\\.(rar|7z)$"; "i"))')"
+          while IFS= read -r key; do
+            [ -n "$key" ] || continue
+            echo "::group::압축 $key"
+            base="$(basename "$key")"
+            d="$(mktemp -d "$work/XXXXXX")"; cd "$d"
+            echo "S3에서 내려받는 중: $base"
+            if aws s3 cp "s3://$B/$key" "$d/$base" --no-progress; then
+              n="$(process_file "$d/$base" "$base" | tail -n1)"
+              if [ "${n:-0}" -gt 0 ]; then
+                aws s3 rm "s3://$B/$key" && echo "완료: $base 해제 (게임파일 ${n}개, 원본 압축 삭제)"
+              else
+                echo "::warning::$base 해제 결과 없음 — 원본 유지"
+              fi
+            else
+              echo "::warning::$base 내려받기 실패"
+            fi
+            cd "$work"; rm -rf "$d"; echo "::endgroup::"
+          done <<< "$arcs"
           echo "끝"
