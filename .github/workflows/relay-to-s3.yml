@@ -1,0 +1,107 @@
+# 업로드 사이트(nintendo-upload-site)에서 "링크로 추가"한 중계사이트 링크를,
+# GitHub 러너가 대신 받아서 "실제 게임 파일"로 nintendo-games 버킷에 올립니다.
+#
+# 동작:
+#   s3://nintendo-games-417178828989/uploads/ 안의 *.url(링크 포인터)을 찾아
+#     1) 링크에서 파일을 내려받고
+#     2) zip/rar/7z 이면 .nsp/.xci/.nsz/.xcz 를 꺼내
+#     3) uploads/ 에 실제 파일로 올린 뒤
+#     4) 처리된 .url 포인터를 삭제합니다.
+#   다운로드/업로드에 실패하면 .url 을 지우지 않고 남겨 다음 실행에 재시도합니다.
+#
+# 실행 방법:
+#   - 5분마다 자동(schedule)
+#   - Actions → "Relay links to S3" → Run workflow (수동)
+#   - repository_dispatch (type: relay-download) — 나중에 Lambda가 즉시 트리거할 때 사용
+#
+# 필요한 저장소 시크릿: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+#   (nintendo-games-417178828989 버킷에 Get/Put/Delete/List 권한 필요)
+name: Relay links to S3
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+  repository_dispatch:
+    types: [relay-download]
+
+concurrency:
+  group: relay-download
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      S3_BUCKET: nintendo-games-417178828989
+      PREFIX: uploads/
+    steps:
+      - name: 도구 설치
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq unar jq
+
+      - name: 디스크 공간 확보
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" 2>/dev/null || true
+          df -h /
+
+      - name: AWS 자격증명 설정
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: 링크 받아서 S3로 올리기
+        run: |
+          set -uo pipefail
+          B="$S3_BUCKET"; P="$PREFIX"
+          work="$RUNNER_TEMP/relay"; mkdir -p "$work"
+
+          keys="$(aws s3api list-objects-v2 --bucket "$B" --prefix "$P" --output json \
+                   | jq -r '(.Contents // []) | .[].Key | select(endswith(".url"))')"
+          if [ -z "${keys:-}" ]; then echo "처리할 링크(.url)가 없습니다"; exit 0; fi
+          echo "처리 대상:"; echo "$keys"
+
+          while IFS= read -r key; do
+            [ -n "$key" ] || continue
+            echo "::group::$key"
+            base="$(basename "$key")"; base="${base%.url}"
+            url="$(aws s3 cp "s3://$B/$key" - 2>/dev/null | head -n1 | tr -d '\r\n')"
+            if [ -z "$url" ]; then echo "::warning::빈 링크, 건너뜀"; echo "::endgroup::"; continue; fi
+
+            d="$(mktemp -d "$work/XXXXXX")"; cd "$d"
+            if ! curl -fL --retry 4 --retry-delay 3 -A "Mozilla/5.0" -o "$base" "$url"; then
+              echo "::warning::다운로드 실패 — .url 유지(다음 실행 재시도): $url"
+              cd "$work"; rm -rf "$d"; echo "::endgroup::"; continue
+            fi
+
+            uploaded=0
+            if lsar "$base" >/dev/null 2>&1; then
+              echo "압축 파일 감지 → 해제"
+              mkdir -p ext
+              unar -q -f -o ext "$base" && rm -f "$base"
+              while IFS= read -r -d '' f; do
+                echo "업로드: $(basename "$f")"
+                aws s3 cp "$f" "s3://$B/$P$(basename "$f")" --no-progress && uploaded=$((uploaded+1))
+              done < <(find ext -type f \( -iname '*.nsp' -o -iname '*.xci' -o -iname '*.nsz' -o -iname '*.xcz' \) -print0)
+            else
+              echo "단일 파일 업로드: $base"
+              aws s3 cp "$base" "s3://$B/$P$base" --no-progress && uploaded=1
+            fi
+
+            if [ "$uploaded" -gt 0 ]; then
+              aws s3 rm "s3://$B/$key" && echo "완료: $base ($uploaded개 업로드, 링크 포인터 정리)"
+            else
+              echo "::warning::$base 에서 올릴 게임 파일(.nsp/.xci/.nsz/.xcz)을 못 찾음 — .url 유지"
+            fi
+            cd "$work"; rm -rf "$d"
+            echo "::endgroup::"
+          done <<< "$keys"
+          echo "끝"
