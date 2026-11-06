@@ -36,6 +36,9 @@ on:
         type: boolean
         default: true
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-26
@@ -68,16 +71,17 @@ jobs:
       - name: Xcode 선택 (27.x 우선)
         run: |
           pick=$(ls -d /Applications/Xcode_27*.app 2>/dev/null | sort -V | tail -1)
+          [ -n "$pick" ] || pick=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | grep -v beta | sort -V | tail -1)
           [ -n "$pick" ] || pick=$(ls -d /Applications/Xcode_*.app 2>/dev/null | grep -v beta | sort -V | tail -1)
           [ -n "$pick" ] || pick=/Applications/Xcode.app
           echo "selected: $pick"
-          sudo xcode-select -s "$pick"
-          # 선택하지 않은 다른 Xcode는 지워 공간 확보
-          for x in /Applications/Xcode_*.app; do [ "$x" = "$pick" ] || sudo rm -rf "$x"; done
+          # 다른 Xcode는 지우지 않는다(디스크 100GB+ 여유, 심링크 짝을 지우면 선택본이 깨짐)
+          sudo xcode-select -s "$pick/Contents/Developer"
           xcodebuild -version
-          xcodebuild -downloadComponent MetalToolchain
+          # Metal 툴체인/iOS 플랫폼 준비(버전 불일치는 --allow-other-metal로 넘어가므로 실패해도 계속)
+          xcodebuild -downloadComponent MetalToolchain || true
           xcodebuild -downloadPlatform iOS || true
-          xcrun -sdk iphoneos metal --version
+          xcrun -sdk iphoneos metal --version || true
           df -h /
 
       - name: nxnative 받기
@@ -168,6 +172,21 @@ jobs:
           compression-level: 0
           retention-days: 3
           if-no-files-found: error
+
+      - name: GitHub 릴리스로 발행 (nago-sign 서명기에서 바로 집어가도록)
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          ipa=$(ls "$RUNNER_TEMP"/out/*.ipa 2>/dev/null | head -1)
+          [ -n "$ipa" ] || { echo "::error::발행할 IPA가 없습니다"; exit 1; }
+          tag="ipa-${GITHUB_RUN_NUMBER}"
+          echo "릴리스 발행: $tag ← $(basename "$ipa")"
+          gh release create "$tag" "$ipa" --repo "$GITHUB_REPOSITORY" \
+            --title "Nintendo IPA ${tag}" \
+            --notes "서명 안 된 IPA입니다. nago-sign 서명기에서 본인 인증서로 재서명 후 설치하세요." \
+            || gh release upload "$tag" "$ipa" --repo "$GITHUB_REPOSITORY" --clobber
 
       - name: 실패 시 로그 업로드
         if: failure()
