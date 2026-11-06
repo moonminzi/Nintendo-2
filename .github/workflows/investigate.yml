@@ -1,0 +1,89 @@
+# 지원 목록에 없는 게임 조사: 버킷 uploads/ 의 게임을 풀어서(nxnative --survey-only)
+# 게임 데이터 목록·파일 형식·압축 속 셰이더 표식·실행 파일 문자열을 보고서로 만든다.
+# 결과: s3://nintendo-games-417178828989/site/investigate/run-<번호>/ 와 아티팩트 "investigate"
+name: Investigate game
+
+on:
+  workflow_dispatch:
+    inputs:
+      nxnative_ref:
+        description: nxnative 브랜치/태그/커밋
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ipa
+  cancel-in-progress: false
+
+jobs:
+  investigate:
+    runs-on: xcode-27
+    timeout-minutes: 240
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
+      S3_BUCKET: nintendo-games-417178828989
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: AWS 자격증명 설정
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: nxnative·도구 준비
+        run: |
+          git clone https://github.com/seedds/nxnative.git nxnative && git -C nxnative checkout "${{ inputs.nxnative_ref }}"
+          brew install zstd sevenzip
+          brew install --cask dotnet-sdk || true
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -r nxnative/.github/requirements/tools.txt
+          "$RUNNER_TEMP/venv/bin/pip" install "backports.zstd; python_version < '3.14'"
+
+      - name: 게임과 키 준비
+        env:
+          PROD_KEYS: ${{ secrets.PROD_KEYS }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/keys" "$RUNNER_TEMP/game"
+          printf '%s\n' "$PROD_KEYS" > "$RUNNER_TEMP/keys/prod.keys"
+          cd "$RUNNER_TEMP/game"
+          aws s3 cp --recursive "s3://$S3_BUCKET/uploads/" . --no-progress
+          shopt -s nullglob nocaseglob
+          for a in *.zip *.rar *.7z; do 7zz x -y -o. "$a" && rm -f "$a"; done
+          find . -mindepth 2 -type f \( -iname '*.nsp' -o -iname '*.xci' -o -iname '*.nsz' -o -iname '*.xcz' \) -exec mv {} . \;
+          ls -la; df -h /
+
+      - name: 추출·분석 보고서(survey)
+        run: |
+          "$RUNNER_TEMP/venv/bin/python" -u nxnative/scripts/build_ipa_from_nsp.py "$RUNNER_TEMP/game" \
+            -k "$RUNNER_TEMP/keys/prod.keys" --survey-only --progress lines 2>&1 | tee "$RUNNER_TEMP/survey.log" || true
+
+      - name: 키 삭제
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/keys"
+
+      - name: 게임 데이터 조사
+        run: |
+          out="$RUNNER_TEMP/inv"; mkdir -p "$out"
+          b=$(ls -d "$RUNNER_TEMP"/game/*_build | head -1)
+          echo "build: $b"; find "$b" -maxdepth 3 | head -80
+          "$RUNNER_TEMP/venv/bin/python" -u repo/tools/investigate.py "$PWD/nxnative" "$b" "$out" 2>&1 | tail -150 || true
+          cp "$RUNNER_TEMP/survey.log" "$out/" || true
+          find "$RUNNER_TEMP/game" -path '*_survey/*' -type f -exec cp {} "$out/" \; || true
+          mkdir -p "$out/logs"; cp -R "$b/logs/." "$out/logs/" 2>/dev/null || true
+          find "$b" -maxdepth 4 > "$out/tree.txt"
+          gzip -k "$out/manifest.tsv" 2>/dev/null || true
+          aws s3 cp --recursive "$out" "s3://$S3_BUCKET/site/investigate/run-${{ github.run_number }}/" --no-progress --exclude manifest.tsv
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: investigate
+          path: ${{ runner.temp }}/inv
+          if-no-files-found: warn
