@@ -3,13 +3,12 @@
 # 준비물 (Settings → Secrets and variables → Actions → New repository secret):
 #   PROD_KEYS : 본인 기기에서 뽑은 prod.keys 파일 내용 전체 (텍스트 그대로 붙여넣기)
 #   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY :
-#               중계사이트에서 받은 게임 파일을 S3 버킷
-#               nintendo-games-417178828989(us-east-1)에 바로 업로드할 IAM 자격증명
+#               게임 파일이 든 S3 버킷 nintendo-games-417178828989(us-east-1) 접근용 IAM 자격증명
 #
-# 게임 링크는 시크릿에 미리 넣을 필요 없이, 실행할 때마다 "game_url" 입력칸에 붙여넣으면 됩니다.
-# (매번 같은 링크를 쓰고 싶으면 GAME_URL 시크릿을 선택적으로 설정해 기본값으로 둘 수 있습니다.)
-# 게임 파일 형식: .nsp/.xci/.nsz/.xcz 하나, 또는 그것들을 담은 .zip / .rar
-#               (본편 + 업데이트 + DLC를 압축 하나로 묶어 두는 것을 권장)
+# 기본 동작: 버킷의 uploads/ 에 있는 게임 파일을 전부 받아서 빌드합니다
+#            (업로드 사이트에서 올리거나 링크로 추가한 것들).
+# 특정 링크 하나만 빌드하려면 실행 시 "game_url" 입력칸에 직접 링크를 넣으면 됩니다(버킷 대신 그 링크 사용).
+# 게임 파일 형식: .nsp/.xci/.nsz/.xcz (또는 그것들을 담은 .zip / .rar / .7z)
 # 그런 다음 Actions → "Build IPA" → Run workflow.
 #
 # 주의: 공개 저장소에서는 로그와 아티팩트(IPA)를 다른 사람도 볼 수 있습니다. 저장소를 Private로 바꾼 뒤 실행하세요.
@@ -19,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       game_url:
-        description: "게임 다운로드 링크 (.nsp/.xci/.nsz/.xcz 또는 .zip/.rar). 비우면 GAME_URL 시크릿 사용"
+        description: "특정 링크만 빌드할 때 입력(.nsp/.xci/.nsz/.xcz 또는 .zip/.rar/.7z). 비우면 버킷 uploads/ 의 파일 전부로 빌드"
         default: ""
       nxnative_ref:
         description: nxnative 브랜치/태그/커밋
@@ -51,10 +50,10 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
           [ -n "$PROD_KEYS" ] || { echo "::error::PROD_KEYS 시크릿이 없습니다"; exit 1; }
-          GAME_URL="${GAME_URL_INPUT:-$GAME_URL_SECRET}"
-          [ -n "$GAME_URL" ]  || { echo "::error::게임 링크가 없습니다. 실행 시 game_url 입력칸에 붙여넣거나 GAME_URL 시크릿을 설정하세요"; exit 1; }
           [ -n "$AWS_ACCESS_KEY_ID" ]     || { echo "::error::AWS_ACCESS_KEY_ID 시크릿이 없습니다"; exit 1; }
           [ -n "$AWS_SECRET_ACCESS_KEY" ] || { echo "::error::AWS_SECRET_ACCESS_KEY 시크릿이 없습니다"; exit 1; }
+          GAME_URL="${GAME_URL_INPUT:-$GAME_URL_SECRET}"
+          if [ -n "$GAME_URL" ]; then echo "입력한 링크로 빌드합니다"; else echo "버킷 uploads/ 의 파일로 빌드합니다"; fi
 
       - name: 디스크 공간 확보
         run: |
@@ -94,29 +93,6 @@ jobs:
           "$RUNNER_TEMP/venv/bin/pip" install -r nxnative/.github/requirements/tools.txt
           "$RUNNER_TEMP/venv/bin/pip" install "backports.zstd; python_version < '3.14'"
 
-      - name: 게임과 키 준비
-        env:
-          PROD_KEYS: ${{ secrets.PROD_KEYS }}
-          GAME_URL_INPUT: ${{ inputs.game_url }}
-          GAME_URL_SECRET: ${{ secrets.GAME_URL }}
-        run: |
-          GAME_URL="${GAME_URL_INPUT:-$GAME_URL_SECRET}"
-          mkdir -p "$RUNNER_TEMP/keys" "$RUNNER_TEMP/game"
-          printf '%s\n' "$PROD_KEYS" > "$RUNNER_TEMP/keys/prod.keys"
-          cd "$RUNNER_TEMP/game"
-          curl -fL --retry 3 -o download.bin "$GAME_URL"
-          if 7zz l download.bin >/dev/null 2>&1; then
-            # zip / rar(RAR5 포함) / 7z 압축 해제
-            7zz x -y -o. download.bin && rm -f download.bin
-          else
-            ext=$(python3 -c "import sys,urllib.parse,os;print(os.path.splitext(urllib.parse.urlparse(sys.argv[1]).path)[1].lower() or '.nsp')" "$GAME_URL")
-            mv download.bin "game$ext"
-          fi
-          # zip/rar 안에 폴더가 있어도 게임 파일을 최상위로 꺼냄
-          find . -mindepth 2 -type f \( -iname '*.nsp' -o -iname '*.xci' -o -iname '*.nsz' -o -iname '*.xcz' \) -exec mv {} . \;
-          ls -la
-          df -h /
-
       - name: AWS 자격증명 설정
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -124,19 +100,50 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-1
 
-      - name: 게임 파일을 S3(nintendo-games)로 바로 업로드
+      - name: 게임과 키 준비
         env:
+          PROD_KEYS: ${{ secrets.PROD_KEYS }}
+          GAME_URL_INPUT: ${{ inputs.game_url }}
+          GAME_URL_SECRET: ${{ secrets.GAME_URL }}
           S3_BUCKET: nintendo-games-417178828989
+          PREFIX: uploads/
         run: |
+          set -euo pipefail
+          GAME_URL="${GAME_URL_INPUT:-$GAME_URL_SECRET}"
+          mkdir -p "$RUNNER_TEMP/keys" "$RUNNER_TEMP/game"
+          printf '%s\n' "$PROD_KEYS" > "$RUNNER_TEMP/keys/prod.keys"
+          cd "$RUNNER_TEMP/game"
+
+          if [ -n "$GAME_URL" ]; then
+            echo "링크에서 받기: $GAME_URL"
+            curl -fL --retry 4 --retry-delay 3 --connect-timeout 30 \
+                 --speed-limit 204800 --speed-time 120 -o download.bin "$GAME_URL"
+          else
+            echo "버킷에서 받기: s3://$S3_BUCKET/$PREFIX"
+            aws s3 cp --recursive "s3://$S3_BUCKET/$PREFIX" . --no-progress
+          fi
+
+          # 받은 것 중 압축(zip/rar/7z)은 풀어서 게임 파일을 꺼냄
           shopt -s nullglob nocaseglob
-          files=("$RUNNER_TEMP/game"/*.nsp "$RUNNER_TEMP/game"/*.xci "$RUNNER_TEMP/game"/*.nsz "$RUNNER_TEMP/game"/*.xcz)
-          [ ${#files[@]} -gt 0 ] || { echo "::error::업로드할 게임 파일이 없습니다 ($RUNNER_TEMP/game)"; exit 1; }
-          for f in "${files[@]}"; do
-            echo "S3 업로드: $(basename "$f") → s3://$S3_BUCKET/"
-            aws s3 cp "$f" "s3://$S3_BUCKET/$(basename "$f")" --no-progress
+          for a in download.bin *.zip *.rar *.7z; do
+            [ -f "$a" ] || continue
+            if 7zz l "$a" >/dev/null 2>&1; then
+              echo "압축 해제: $a"
+              7zz x -y -o. "$a" && rm -f "$a"
+            elif [ "$a" = "download.bin" ]; then
+              ext=$(python3 -c "import sys,urllib.parse,os;print(os.path.splitext(urllib.parse.urlparse(sys.argv[1]).path)[1].lower() or '.nsp')" "$GAME_URL")
+              mv download.bin "game$ext"
+            fi
           done
-          echo "현재 버킷 내용:"
-          aws s3 ls "s3://$S3_BUCKET/"
+
+          # 하위 폴더의 게임 파일을 최상위로
+          find . -mindepth 2 -type f \( -iname '*.nsp' -o -iname '*.xci' -o -iname '*.nsz' -o -iname '*.xcz' \) -exec mv {} . \;
+
+          # 빌드 대상 확인
+          games=(*.nsp *.xci *.nsz *.xcz)
+          [ ${#games[@]} -gt 0 ] || { echo "::error::빌드할 게임 파일(.nsp/.xci/.nsz/.xcz)이 없습니다 (버킷 uploads/ 가 비었거나 링크가 잘못됨)"; exit 1; }
+          echo "빌드 대상:"; printf ' - %s\n' "${games[@]}"
+          df -h /
 
       - name: IPA 빌드
         run: |
