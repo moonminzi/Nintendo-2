@@ -5,6 +5,7 @@
 #
 # 게임 파일은 둘 중 하나로 넣습니다 (워크플로 입력 game_source):
 #   s3  (기본) : 업로드 사이트로 S3 버킷 nintendo-games-417178828989 의 uploads/ 에 올린 파일을 전부 받습니다.
+#                업로드 사이트에서 "링크로 추가"한 링크도 여기서 함께 받습니다.
 #                GitHub OIDC로 IAM 역할 nintendo-github-build 를 맡으므로 AWS 키 시크릿이 필요 없습니다.
 #   url        : 시크릿 GAME_URL 의 직접 다운로드 링크(.nsp/.xci/.nsz/.xcz 하나, 또는 그것들을 담은 .zip)
 # 그런 다음 Actions → "Build IPA" → Run workflow.
@@ -117,6 +118,22 @@ jobs:
           if [ "$SOURCE" = "s3" ]; then
             aws s3 ls "s3://$GAME_BUCKET/uploads/" --human-readable
             aws s3 cp "s3://$GAME_BUCKET/uploads/" . --recursive --no-progress
+            # 업로드 사이트에서 "링크로 추가"한 항목(이름.url, 안에 링크 한 줄)은 여기서 직접 받음
+            find . -maxdepth 1 -type f -name '*.url' -print0 | while IFS= read -r -d '' f; do
+              url=$(head -n1 "$f" | tr -d '\r')
+              out="${f%.url}"
+              rm -f "$f"
+              echo "download: $out"
+              curl -fL --no-progress-meter --retry 5 --retry-delay 10 --retry-all-errors -A 'Mozilla/5.0' -o "$out" "$url"
+              magic=$(head -c 512 "$out" | LC_ALL=C tr -d '\000' | tr '[:upper:]' '[:lower:]')
+              case "$magic" in
+                *'<!doctype html'*|*'<html'*) echo "::error::$out 링크가 파일이 아니라 웹페이지를 돌려줬어요 (공개 설정/직접 다운로드 링크 확인)"; exit 1 ;;
+              esac
+              case "$(echo "$out" | tr '[:upper:]' '[:lower:]')" in
+                *.nsp|*.xci|*.nsz|*.xcz|*.zip) ;;
+                *) if [ "$(head -c 2 "$out")" = "PK" ]; then mv "$out" "$out.zip"; else mv "$out" "$out.nsp"; fi ;;
+              esac
+            done
           else
             curl -fL --retry 3 -o download.bin "$GAME_URL"
             if unzip -tq download.bin >/dev/null 2>&1; then
