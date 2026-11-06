@@ -143,8 +143,19 @@ jobs:
           xcrun -sdk iphoneos metal --version || true
           df -h /
 
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+
       - name: nxnative 받기
-        run: git clone https://github.com/seedds/nxnative.git nxnative && git -C nxnative checkout "${{ inputs.nxnative_ref }}" && git -C nxnative log -1 --oneline
+        run: |
+          git clone https://github.com/seedds/nxnative.git nxnative && git -C nxnative checkout "${{ inputs.nxnative_ref }}" && git -C nxnative log -1 --oneline
+          # 우리 쪽 추가 패치(예: Level-5 NXGL 셰이더 읽기). 원본이 바뀌어 안 맞으면 경고만 하고 계속
+          for p in repo/patches/nxnative/*.patch; do
+            [ -f "$p" ] || continue
+            if git -C nxnative apply --check "$PWD/$p" 2>/dev/null; then git -C nxnative apply "$PWD/$p" && echo "패치 적용: $p"
+            else echo "::warning::패치가 맞지 않아 건너뜀: $p"; fi
+          done
 
       - name: 도구 설치
         run: |
