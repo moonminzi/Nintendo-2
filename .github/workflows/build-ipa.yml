@@ -2,8 +2,11 @@
 #
 # 준비물 (Settings → Secrets and variables → Actions → New repository secret):
 #   PROD_KEYS : 본인 기기에서 뽑은 prod.keys 파일 내용 전체 (텍스트 그대로 붙여넣기)
-#   GAME_URL  : 게임 파일(.nsp/.xci/.nsz/.xcz 하나, 또는 그것들을 담은 .zip)의 직접 다운로드 링크
-#               (본편 + 업데이트 + DLC를 zip 하나로 묶어 두는 것을 권장)
+#
+# 게임 파일은 둘 중 하나로 넣습니다 (워크플로 입력 game_source):
+#   s3  (기본) : 업로드 사이트로 S3 버킷 nintendo-games-417178828989 의 uploads/ 에 올린 파일을 전부 받습니다.
+#                GitHub OIDC로 IAM 역할 nintendo-github-build 를 맡으므로 AWS 키 시크릿이 필요 없습니다.
+#   url        : 시크릿 GAME_URL 의 직접 다운로드 링크(.nsp/.xci/.nsz/.xcz 하나, 또는 그것들을 담은 .zip)
 # 그런 다음 Actions → "Build IPA" → Run workflow.
 #
 # 주의: 공개 저장소에서는 로그와 아티팩트(IPA)를 다른 사람도 볼 수 있습니다. 저장소를 Private로 바꾼 뒤 실행하세요.
@@ -12,6 +15,11 @@ name: Build IPA
 on:
   workflow_dispatch:
     inputs:
+      game_source:
+        description: "게임 파일 위치: s3 = 업로드 사이트로 올린 파일, url = GAME_URL 시크릿"
+        type: choice
+        options: [s3, url]
+        default: s3
       nxnative_ref:
         description: nxnative 브랜치/태그/커밋
         default: main
@@ -28,6 +36,15 @@ on:
         type: boolean
         default: true
 
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: us-east-1
+  GAME_BUCKET: nintendo-games-417178828989
+  GAME_ROLE: arn:aws:iam::417178828989:role/nintendo-github-build
+
 jobs:
   build:
     runs-on: macos-26
@@ -39,7 +56,9 @@ jobs:
           GAME_URL: ${{ secrets.GAME_URL }}
         run: |
           [ -n "$PROD_KEYS" ] || { echo "::error::PROD_KEYS 시크릿이 없습니다"; exit 1; }
-          [ -n "$GAME_URL" ]  || { echo "::error::GAME_URL 시크릿이 없습니다"; exit 1; }
+          if [ "${{ inputs.game_source }}" = "url" ]; then
+            [ -n "$GAME_URL" ] || { echo "::error::GAME_URL 시크릿이 없습니다"; exit 1; }
+          fi
 
       - name: 디스크 공간 확보
         run: |
@@ -79,23 +98,43 @@ jobs:
           "$RUNNER_TEMP/venv/bin/pip" install -r nxnative/.github/requirements/tools.txt
           "$RUNNER_TEMP/venv/bin/pip" install "backports.zstd; python_version < '3.14'"
 
+      - name: AWS 로그인 (OIDC)
+        if: inputs.game_source == 's3'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.GAME_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
       - name: 게임과 키 준비
         env:
           PROD_KEYS: ${{ secrets.PROD_KEYS }}
           GAME_URL: ${{ secrets.GAME_URL }}
+          SOURCE: ${{ inputs.game_source }}
         run: |
           mkdir -p "$RUNNER_TEMP/keys" "$RUNNER_TEMP/game"
           printf '%s\n' "$PROD_KEYS" > "$RUNNER_TEMP/keys/prod.keys"
           cd "$RUNNER_TEMP/game"
-          curl -fL --retry 3 -o download.bin "$GAME_URL"
-          if unzip -tq download.bin >/dev/null 2>&1; then
-            unzip -q download.bin && rm download.bin
-            # zip 안에 폴더가 있어도 게임 파일을 최상위로 꺼냄
-            find . -mindepth 2 -type f \( -iname '*.nsp' -o -iname '*.xci' -o -iname '*.nsz' -o -iname '*.xcz' \) -exec mv {} . \;
+          if [ "$SOURCE" = "s3" ]; then
+            aws s3 ls "s3://$GAME_BUCKET/uploads/" --human-readable
+            aws s3 cp "s3://$GAME_BUCKET/uploads/" . --recursive --no-progress
           else
-            ext=$(python3 -c "import sys,urllib.parse,os;print(os.path.splitext(urllib.parse.urlparse(sys.argv[1]).path)[1].lower() or '.nsp')" "$GAME_URL")
-            mv download.bin "game$ext"
+            curl -fL --retry 3 -o download.bin "$GAME_URL"
+            if unzip -tq download.bin >/dev/null 2>&1; then
+              mv download.bin download.zip
+            else
+              ext=$(python3 -c "import sys,urllib.parse,os;print(os.path.splitext(urllib.parse.urlparse(sys.argv[1]).path)[1].lower() or '.nsp')" "$GAME_URL")
+              mv download.bin "game$ext"
+            fi
           fi
+          # zip은 풀고(4GB 넘는 zip도 되도록 ditto 사용) 원본은 지워 공간 확보
+          find . -maxdepth 1 -type f -iname '*.zip' -print0 | while IFS= read -r -d '' z; do
+            echo "unzip: $z"; ditto -x -k "$z" . && rm -f "$z"
+          done
+          # 폴더 안에 있던 게임 파일을 최상위로 꺼냄
+          find . -mindepth 2 -type f \( -iname '*.nsp' -o -iname '*.xci' -o -iname '*.nsz' -o -iname '*.xcz' \) -exec mv {} . \;
+          rm -rf __MACOSX
+          n=$(find . -maxdepth 1 -type f \( -iname '*.nsp' -o -iname '*.xci' -o -iname '*.nsz' -o -iname '*.xcz' \) | wc -l)
+          [ "$n" -gt 0 ] || { echo "::error::게임 파일(.nsp/.xci/.nsz/.xcz)이 없습니다"; ls -la; exit 1; }
           ls -la
           df -h /
 
