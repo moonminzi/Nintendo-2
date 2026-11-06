@@ -76,6 +76,34 @@ jobs:
           work="$RUNNER_TEMP/relay"; mkdir -p "$work"
           GAME='-iname *.nsp -o -iname *.xci -o -iname *.nsz -o -iname *.xcz'
 
+          # 진행 상태를 s3://<버킷>/site/relay.json 에 남긴다(업로드 사이트가 막대로 보여 준다)
+          cat > "$RUNNER_TEMP/rep.py" <<'PY'
+          import json, sys, time
+          state, phase, name, done, total, t0 = (sys.argv[1:7] + [""] * 6)[:6]
+          done, total = int(done or 0), int(total or 0)
+          t0 = float(t0 or time.time())
+          now = time.time()
+          rate = done / max(now - t0, 0.001) if done else 0.0
+          eta = (total - done) / rate if rate > 0 and total > done else None
+          print(json.dumps({"state": state, "phase": phase, "name": name, "done": done, "total": total,
+                            "rate": rate, "eta": eta, "started": t0, "updated": now}, ensure_ascii=False))
+          PY
+          rep() {  # rep <state> <phase> <name> <받은 바이트> <전체 바이트> <시작 시각>
+            python3 "$RUNNER_TEMP/rep.py" "$@" \
+              | aws s3 cp - "s3://$B/site/relay.json" --content-type application/json --no-progress >/dev/null 2>&1 || true
+          }
+          # watch <pid> <파일> <전체 바이트> <단계> <이름>: 백그라운드 작업이 끝날 때까지 4초마다 받은 크기를 기록
+          watch() {
+            local pid="$1" t0
+            t0=$(date +%s)
+            while kill -0 "$pid" 2>/dev/null; do
+              rep running "$4" "$5" "$(stat -c%s "$2" 2>/dev/null || echo 0)" "$3" "$t0"
+              sleep 4
+            done
+            wait "$pid"
+          }
+          n_ok=0; n_fail=0; last_err=""
+
           # 파일 하나 처리: rar/7z면 풀어서 게임파일 업로드, 아니면 그대로 업로드.
           # 사람이 읽는 로그는 stderr로, 업로드 개수만 stdout 마지막 줄로 반환.
           process_file() {
@@ -84,6 +112,7 @@ jobs:
             case "$low" in
               *.rar|*.7z)
                 echo "압축 해제 중: $name" >&2
+                rep running "압축 푸는 중" "$name" 0 0 "$(date +%s)"
                 rm -rf ext && mkdir -p ext
                 ok=0
                 if [ "${low##*.}" = "rar" ] && command -v unrar >/dev/null 2>&1; then
@@ -101,6 +130,7 @@ jobs:
                 if [ "$ok" = 1 ]; then
                   while IFS= read -r -d '' g; do
                     echo "업로드: $(basename "$g")" >&2
+                    rep running "버킷에 올리는 중" "$(basename "$g")" 0 "$(stat -c%s "$g")" "$(date +%s)"
                     aws s3 cp "$g" "s3://$B/$P$(basename "$g")" --no-progress >&2 && up=$((up+1))
                   done < <(find ext -type f \( $GAME \) -print0)
                 else
@@ -109,6 +139,7 @@ jobs:
                 ;;
               *)
                 echo "그대로 업로드: $name" >&2
+                rep running "버킷에 올리는 중" "$name" 0 "$(stat -c%s "$f")" "$(date +%s)"
                 aws s3 cp "$f" "s3://$B/$P$name" --no-progress >&2 && up=1
                 ;;
             esac
@@ -125,17 +156,25 @@ jobs:
             url="$(aws s3 cp "s3://$B/$key" - 2>/dev/null | head -n1 | tr -d '\r\n')"
             if [ -z "$url" ]; then echo "::warning::빈 링크"; echo "::endgroup::"; continue; fi
             d="$(mktemp -d "$work/XXXXXX")"; cd "$d"
-            if curl -fL --retry 4 --retry-delay 3 --connect-timeout 30 \
-                    --speed-limit 204800 --speed-time 120 \
-                    -A "Mozilla/5.0" -o "$base" "$url"; then
+            # 전체 크기: 사이트가 링크를 추가할 때 알아 둔 값(모르면 0)
+            total=$(aws s3api head-object --bucket "$B" --key "$key" --query 'Metadata.size' --output text 2>/dev/null || echo 0)
+            case "$total" in ''|*[!0-9]*) total=0 ;; esac
+            rep running "다운로드 시작" "$base" 0 "$total" "$(date +%s)"
+            curl -fL --retry 4 --retry-delay 3 --connect-timeout 30 \
+                 --speed-limit 204800 --speed-time 120 \
+                 -A "Mozilla/5.0" -o "$base" "$url" &
+            if watch $! "$base" "$total" "다운로드 중" "$base"; then
               n="$(process_file "$d/$base" "$base" | tail -n1)"
               if [ "${n:-0}" -gt 0 ]; then
                 aws s3 rm "s3://$B/$key" && echo "완료: $base (게임파일 ${n}개, 링크 정리)"
+                n_ok=$((n_ok+1))
               else
                 echo "::warning::$base 처리 결과 없음 — .url 유지"
+                n_fail=$((n_fail+1)); last_err="$base: 받은 파일에서 게임 파일을 못 찾음"
               fi
             else
               echo "::warning::다운로드 실패/너무 느림 — .url 유지(다음 실행 재시도): $url"
+              n_fail=$((n_fail+1)); last_err="$base: 다운로드 실패 또는 너무 느림"
             fi
             cd "$work"; rm -rf "$d"; echo "::endgroup::"
           done <<< "$keys"
@@ -149,18 +188,31 @@ jobs:
             base="$(basename "$key")"
             d="$(mktemp -d "$work/XXXXXX")"; cd "$d"
             echo "S3에서 내려받는 중: $base"
-            if aws s3 cp "s3://$B/$key" "$d/$base" --no-progress; then
+            size=$(aws s3api head-object --bucket "$B" --key "$key" --query 'ContentLength' --output text 2>/dev/null || echo 0)
+            case "$size" in ''|*[!0-9]*) size=0 ;; esac
+            aws s3 cp "s3://$B/$key" "$d/$base" --no-progress &
+            if watch $! "$d/$base" "$size" "버킷에서 압축 파일 받는 중" "$base"; then
               n="$(process_file "$d/$base" "$base" | tail -n1)"
               if [ "${n:-0}" -gt 0 ]; then
                 aws s3 rm "s3://$B/$key" && echo "완료: $base 해제 (게임파일 ${n}개, 원본 압축 삭제)"
+                n_ok=$((n_ok+1))
               else
                 echo "::warning::$base 해제 결과 없음 — 원본 유지"
+                n_fail=$((n_fail+1)); last_err="$base: 압축을 풀지 못함"
               fi
             else
               echo "::warning::$base 내려받기 실패"
+              n_fail=$((n_fail+1)); last_err="$base: 버킷에서 받기 실패"
             fi
             cd "$work"; rm -rf "$d"; echo "::endgroup::"
           done <<< "$arcs"
+          if [ $((n_ok + n_fail)) -gt 0 ]; then
+            if [ "$n_fail" -gt 0 ]; then
+              rep failed "실패 ${n_fail}개 — 다음 실행에 다시 시도해요 (${last_err})" "" 0 0 "$(date +%s)"
+            else
+              rep done "다 받았어요 (${n_ok}개)" "" 0 0 "$(date +%s)"
+            fi
+          fi
           echo "끝"
 
       - name: 예약된 자동 빌드 시작
