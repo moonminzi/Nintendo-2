@@ -175,20 +175,39 @@ jobs:
           retention-days: 3
           if-no-files-found: error
 
+      # GitHub 릴리스 첨부파일은 2GiB 미만만 허용된다. 게임 데이터를 포함한(bundle) IPA는 보통 그보다 크므로,
+      # 2GiB 이상이면 IPA를 S3 버킷 ipa/ 에 올리고 7일짜리 다운로드 링크를 릴리스 본문과 download-url.txt 에 넣는다.
       - name: GitHub 릴리스로 발행 (nago-sign 서명기에서 바로 집어가도록)
         if: success()
         env:
           GH_TOKEN: ${{ github.token }}
+          S3_BUCKET: nintendo-games-417178828989
         run: |
-          set -e
+          set -euo pipefail
           ipa=$(ls "$RUNNER_TEMP"/out/*.ipa 2>/dev/null | head -1)
           [ -n "$ipa" ] || { echo "::error::발행할 IPA가 없습니다"; exit 1; }
+          name=$(basename "$ipa")
+          size=$(stat -f%z "$ipa")
           tag="ipa-${GITHUB_RUN_NUMBER}"
-          echo "릴리스 발행: $tag ← $(basename "$ipa")"
-          gh release create "$tag" "$ipa" --repo "$GITHUB_REPOSITORY" \
-            --title "Nintendo IPA ${tag}" \
-            --notes "서명 안 된 IPA입니다. nago-sign 서명기에서 본인 인증서로 재서명 후 설치하세요." \
-            || gh release upload "$tag" "$ipa" --repo "$GITHUB_REPOSITORY" --clobber
+          notes="서명 안 된 IPA입니다. nago-sign 서명기에서 본인 인증서로 재서명 후 설치하세요."
+          echo "릴리스 발행: $tag ← $name ($(( size / 1024 / 1024 )) MB)"
+          if [ "$size" -lt 2147483648 ]; then
+            assets=("$ipa")
+          else
+            key="ipa/${tag}/${name}"
+            echo "2GiB 이상이라 릴리스에 첨부할 수 없어 S3에 올립니다: s3://$S3_BUCKET/$key"
+            aws s3 cp "$ipa" "s3://$S3_BUCKET/$key" --no-progress
+            url=$(aws s3 presign "s3://$S3_BUCKET/$key" --expires-in 604800)
+            printf '%s\n' "$url" > "$RUNNER_TEMP/download-url.txt"
+            assets=("$RUNNER_TEMP/download-url.txt")
+            notes="${notes}
+
+          IPA 크기가 $(( size / 1024 / 1024 )) MB로 GitHub 릴리스 한도(2GB)를 넘어 S3에 올렸습니다.
+          다운로드 링크(7일 유효): ${url}"
+          fi
+          gh release create "$tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY" \
+            --title "Nintendo IPA ${tag}" --notes "$notes" \
+            || gh release upload "$tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
 
       - name: 실패 시 로그 업로드
         if: failure()
