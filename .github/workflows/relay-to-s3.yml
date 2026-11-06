@@ -40,7 +40,15 @@ jobs:
       PREFIX: uploads/
     steps:
       - name: 도구 설치
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq 7zip jq
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq
+          # RAR5를 확실히 푸는 unrar를 우선, 7-Zip 계열은 보조로 (없어도 실패하지 않음)
+          sudo apt-get install -y unrar || true
+          sudo apt-get install -y 7zip || true
+          sudo apt-get install -y p7zip-full || true
+          echo "== 사용 가능한 추출기 =="
+          for t in unrar 7zz 7z 7za; do printf '%s: ' "$t"; command -v "$t" || echo "(없음)"; done
 
       - name: 디스크 공간 확보
         run: |
@@ -73,13 +81,26 @@ jobs:
               *.rar|*.7z)
                 echo "압축 해제 중: $name" >&2
                 rm -rf ext && mkdir -p ext
-                if 7zz x -y -oext "$f" >&2; then
+                ok=0
+                if [ "${low##*.}" = "rar" ] && command -v unrar >/dev/null 2>&1; then
+                  unrar x -o+ -y "$f" ext/ >&2 && ok=1
+                fi
+                if [ "$ok" = 0 ] && command -v 7zz >/dev/null 2>&1; then
+                  7zz x -y -oext "$f" >&2 && ok=1
+                fi
+                if [ "$ok" = 0 ] && command -v 7z  >/dev/null 2>&1; then
+                  7z  x -y -oext "$f" >&2 && ok=1
+                fi
+                if [ "$ok" = 0 ] && command -v 7za >/dev/null 2>&1; then
+                  7za x -y -oext "$f" >&2 && ok=1
+                fi
+                if [ "$ok" = 1 ]; then
                   while IFS= read -r -d '' g; do
                     echo "업로드: $(basename "$g")" >&2
                     aws s3 cp "$g" "s3://$B/$P$(basename "$g")" --no-progress >&2 && up=$((up+1))
                   done < <(find ext -type f \( $GAME \) -print0)
                 else
-                  echo "::warning::압축 해제 실패: $name" >&2
+                  echo "::error::압축 해제 실패(추출기 없음 또는 오류): $name" >&2
                 fi
                 ;;
               *)
