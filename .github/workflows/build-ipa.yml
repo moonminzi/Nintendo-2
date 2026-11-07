@@ -248,14 +248,6 @@ jobs:
         run: rm -rf "$RUNNER_TEMP/keys"
 
       # archive: false → zip으로 묶지 않고 .ipa 파일 그대로 올린다(내려받으면 바로 .ipa, 아티팩트 이름 = 파일명)
-      - name: IPA 업로드
-        uses: actions/upload-artifact@v7
-        with:
-          path: ${{ runner.temp }}/out/*.ipa
-          archive: false
-          retention-days: 3
-          if-no-files-found: error
-
       # IPA는 크기와 상관없이 항상 S3 ipa/<태그>/ 에 올린다(업로드 사이트·서명기가 여기서 집어 간다).
       # GitHub 릴리스 첨부는 2GiB 미만만 허용되므로, 그 이상이면 릴리스에는 7일짜리 다운로드 링크를 넣는다.
       - name: IPA 올리기 · 릴리스 · 자동 서명
@@ -354,6 +346,7 @@ jobs:
 
       - name: 실패 시 로그 업로드
         if: failure()
+        continue-on-error: true   # GitHub 아티팩트 저장 한도가 차도 빌드를 실패로 만들지 않음
         uses: actions/upload-artifact@v4
         with:
           name: logs
