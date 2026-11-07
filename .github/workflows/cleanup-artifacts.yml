@@ -1,0 +1,30 @@
+# GitHub Actions 아티팩트 저장 공간 비우기: 이 저장소의 아티팩트를 전부 지운다.
+# (IPA·게임 데이터는 S3에 있으므로 아티팩트는 지워도 됨. 저장 한도 재계산은 GitHub 쪽에서 6~12시간 걸림)
+name: Cleanup artifacts
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 아티팩트 전부 삭제
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          total=0; n=0
+          while :; do
+            page=$(gh api "repos/$REPO/actions/artifacts?per_page=100" --jq '.artifacts[] | "\(.id) \(.size_in_bytes) \(.name)"')
+            [ -n "$page" ] || break
+            while read -r id size name; do
+              gh api -X DELETE "repos/$REPO/actions/artifacts/$id" && n=$((n+1)) && total=$((total+size))
+              echo "삭제: $name ($((size/1024/1024)) MB)"
+            done <<< "$page"
+          done
+          echo "총 ${n}개, $((total/1024/1024)) MB 삭제"
