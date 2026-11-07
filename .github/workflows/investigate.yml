@@ -86,6 +86,16 @@ jobs:
               "$RUNNER_TEMP/venv/bin/python" -u repo/tools/dump_romfs.py "$PWD/nxnative" "$img" "$out/dump/$(basename "$(dirname "$img")")" "${{ inputs.dump }}" | tail -40
             done
           fi
+          # 실행 파일(ExeFS: main, sdk 등) 원본과 압축 푼 이미지 → exefs/ (코드 분석용)
+          mkdir -p "$out/exefs"
+          for d in "$b"/*_build/extract/*/ExeFS; do
+            v=$(basename "$(dirname "$d")"); mkdir -p "$out/exefs/$v"; cp "$d"/* "$out/exefs/$v/" 2>/dev/null || true
+            for m in "$d"/main "$d"/sdk; do
+              [ -f "$m" ] && "$RUNNER_TEMP/venv/bin/python" -c "import sys;sys.path.insert(0,'nxnative/dm/tools');import nso;d=open(sys.argv[1],'rb').read();m=nso.load(d,sys.argv[1]);open(sys.argv[2],'wb').write(bytes(m.image));print(sys.argv[1],'text_end',hex(m.text_end))" "$m" "$out/exefs/$v/$(basename "$m").img" || true
+            done
+            "$RUNNER_TEMP/venv/bin/python" nxnative/dm/tools/fps_target.py "$d/main" > "$out/exefs/$v/fps_target.txt" 2>&1 || true
+          done
+          ls -laR "$out/exefs" | head -40
           [ "${{ inputs.scan }}" = "true" ] && "$RUNNER_TEMP/venv/bin/python" -u repo/tools/investigate.py "$PWD/nxnative" "$b" "$out" 2>&1 | tail -150 || true
           cp "$RUNNER_TEMP/survey.log" "$out/" || true
           find "$b" -path '*_survey/*.md' -type f -exec cp {} "$out/" \; || true
