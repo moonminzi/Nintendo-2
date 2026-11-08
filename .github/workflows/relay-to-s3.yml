@@ -235,9 +235,11 @@ jobs:
           lang=$(jq -r '.language // "ko"' "$RUNNER_TEMP/auto.json")
           case "$romfs" in bundle|separate) ;; *) romfs=bundle ;; esac
           case "$lang" in *[!A-Za-z-]*) lang=ko ;; esac
+          cert=$(jq -r '.cert // "0"' "$RUNNER_TEMP/auto.json")
+          case "$cert" in 0|1|2) sign=true ;; none) sign=false; cert=0 ;; *) sign=true; cert=0 ;; esac
           aws s3 rm "s3://$S3_BUCKET/site/autobuild.json"
           gh workflow run build-ipa.yml --repo "$GITHUB_REPOSITORY" --ref main \
-            -f romfs="$romfs" -f language="$lang" -f auto_sign=true
+            -f romfs="$romfs" -f language="$lang" -f auto_sign="$sign" -f sign_cert="$cert"
           printf '{"state": "queued", "phase": "빌드 시작 요청됨 (러너 기다리는 중)", "updated": %s, "started": %s}' "$(date +%s)" "$(date +%s)" \
             | aws s3 cp - "s3://$S3_BUCKET/site/build.json" --content-type application/json
           echo "Build IPA 시작 요청 (romfs=$romfs, language=$lang)"

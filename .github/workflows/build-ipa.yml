@@ -39,6 +39,9 @@ on:
         description: 빌드가 끝나면 nago-sign 서명기로 바로 서명 시작
         type: boolean
         default: true
+      sign_cert:
+        description: "자동 서명 인증서 번호 (nago-sign 순서: 0 lily chen, 1 Hassan Aoutouf, 2 Beate Fenster)"
+        default: "0"
       romfs_patch:
         description: "게임 데이터 패치(xdelta, 예 한국어 패치) zip의 S3 키 (예 patch/yw4_korpatch_2.2.0.zip). 적용 결과를 patch.zip 으로 올림. 비우면 안 함"
         default: ""
@@ -255,6 +258,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           AUTO_SIGN: ${{ inputs.auto_sign }}
+          SIGN_CERT: ${{ inputs.sign_cert }}
           ROMFS: ${{ inputs.romfs }}
         run: |
           set -euo pipefail
@@ -304,14 +308,15 @@ jobs:
             exit 0
           fi
           python3 "$RUNNER_TEMP/st.py" running "서명 요청 중"
-          payload=$(python3 -c 'import json,sys; print(json.dumps({"nago_api": "sign", "body": {"source": "s3:" + sys.argv[1], "bundle": "keep", "cert": 0}}))' "$key")
+          payload=$(python3 -c 'import json,sys; c=sys.argv[2]; print(json.dumps({"nago_api": "sign", "body": {"source": "s3:" + sys.argv[1], "bundle": "keep", "cert": int(c) if c.isdigit() else 0}}))' "$key" "${SIGN_CERT:-0}")
           job=""
           if aws lambda invoke --region ap-northeast-2 --function-name nago-sign \
                --cli-binary-format raw-in-base64-out --payload "$payload" "$RUNNER_TEMP/sign.json" >/dev/null; then
             job=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("job", ""))' "$RUNNER_TEMP/sign.json" || true)
           fi
           if [ -n "$job" ]; then
-            printf '{"job": "%s", "key": "%s", "by": "build"}' "$job" "$key" \
+            c="${SIGN_CERT:-0}"; case "$c" in *[!0-9]*|"") c=0 ;; esac
+            printf '{"job": "%s", "key": "%s", "by": "build", "cert": %s}' "$job" "$key" "$c" \
               | aws s3 cp - "s3://$S3_BUCKET/site/sign/${tag}.json" --content-type application/json
             python3 "$RUNNER_TEMP/st.py" done "빌드 완료 · 서명 진행 중" "sign_job=$job"
           else
