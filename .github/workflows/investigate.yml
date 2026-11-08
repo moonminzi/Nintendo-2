@@ -31,6 +31,8 @@ jobs:
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
       S3_BUCKET: nintendo-games-417178828989
+      CF_DOMAIN: d1g40m438o0voh.cloudfront.net
+      CF_KEY_ID: K1E111JA4E4O13
     steps:
       - uses: actions/checkout@v4
         with:
@@ -60,7 +62,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/keys" "$RUNNER_TEMP/game"
           printf '%s\n' "$PROD_KEYS" > "$RUNNER_TEMP/keys/prod.keys"
           cd "$RUNNER_TEMP/game"
-          aws s3 cp --recursive "s3://$S3_BUCKET/uploads/" . --no-progress
+          aws secretsmanager get-secret-value --region us-east-1 --secret-id nintendo/cloudfront-key --query SecretString --output text > "$RUNNER_TEMP/keys/cf.pem" || true
+          CF_KEY_FILE="$RUNNER_TEMP/keys/cf.pem" python3 "$GITHUB_WORKSPACE/repo/tools/cf_get.py" uploads/ .
           shopt -s nullglob nocaseglob
           for a in *.zip *.rar *.7z; do 7zz x -y -o. "$a" && rm -f "$a"; done
           find . -mindepth 2 -type f \( -iname '*.nsp' -o -iname '*.xci' -o -iname '*.nsz' -o -iname '*.xcz' \) -exec mv {} . \;
