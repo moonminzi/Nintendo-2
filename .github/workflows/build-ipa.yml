@@ -64,6 +64,8 @@ jobs:
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
       S3_BUCKET: nintendo-games-417178828989
+      CF_DOMAIN: d1g40m438o0voh.cloudfront.net
+      CF_KEY_ID: K1E111JA4E4O13
     steps:
       - name: 시크릿 확인
         env:
@@ -198,7 +200,9 @@ jobs:
                  --speed-limit 204800 --speed-time 120 -o download.bin "$GAME_URL"
           else
             echo "버킷에서 받기: s3://$S3_BUCKET/$PREFIX"
-            aws s3 cp --recursive "s3://$S3_BUCKET/$PREFIX" . --no-progress
+            # CloudFront(무료 1TB)로 받는다. 개인키는 Secrets Manager에서 잠깐 꺼내 쓰고 키 삭제 단계에서 지운다
+            aws secretsmanager get-secret-value --region us-east-1 --secret-id nintendo/cloudfront-key --query SecretString --output text > "$RUNNER_TEMP/keys/cf.pem" || true
+            CF_KEY_FILE="$RUNNER_TEMP/keys/cf.pem" python3 "$GITHUB_WORKSPACE/repo/tools/cf_get.py" "$PREFIX" .
           fi
 
           # 받은 것 중 압축(zip/rar/7z)은 풀어서 게임 파일을 꺼냄
@@ -336,7 +340,9 @@ jobs:
           img=$(ls "$RUNNER_TEMP"/game/*_build/extract/*/RomFS.img 2>/dev/null | head -1)
           [ -n "$img" ] || { echo "::error::추출된 RomFS.img가 없습니다 (romfs=separate 로 빌드해야 남음)"; exit 1; }
           w="$RUNNER_TEMP/rpatch"; mkdir -p "$w/src" "$w/out/patch"
-          aws s3 cp "s3://$S3_BUCKET/$PATCH_KEY" "$w/patch.zip" --no-progress
+          [ -f "$RUNNER_TEMP/keys/cf.pem" ] || { mkdir -p "$RUNNER_TEMP/keys"; aws secretsmanager get-secret-value --region us-east-1 --secret-id nintendo/cloudfront-key --query SecretString --output text > "$RUNNER_TEMP/keys/cf.pem" || true; }
+          CF_KEY_FILE="$RUNNER_TEMP/keys/cf.pem" python3 "$GITHUB_WORKSPACE/repo/tools/cf_get.py" "$PATCH_KEY" "$w/dl"
+          mv "$w/dl/$(basename "$PATCH_KEY")" "$w/patch.zip"; rm -f "$RUNNER_TEMP/keys/cf.pem"
           7zz x -y ${PATCH_PW:+-p"$PATCH_PW"} -o"$w/src" "$w/patch.zip" >/dev/null
           "$RUNNER_TEMP/venv/bin/python" -u repo/tools/apply_xdelta.py "$PWD/nxnative" "$img" "$w/src" "$w/out/patch"
           # 압축 안 함(cpk는 이미 압축돼 있음): 파일 앱에서 풀면 patch 폴더가 생긴다
