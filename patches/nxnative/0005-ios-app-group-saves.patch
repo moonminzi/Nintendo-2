@@ -1,0 +1,47 @@
+diff --git a/dm/ios/Sources/CloudSaves.m b/dm/ios/Sources/CloudSaves.m
+index ae4edc0..295de52 100644
+--- a/dm/ios/Sources/CloudSaves.m
++++ b/dm/ios/Sources/CloudSaves.m
+@@ -64,6 +64,33 @@ void dm_clear_cloud_saves(void) {
+     [NSUserDefaults.standardUserDefaults removeObjectForKey:kCloudSaves];
+ }
+ 
++// The app group's shared folder for saves, when no folder was picked: every game signed with the same certificate (the signer
++// adds the profile's app groups) shares it, so a game deleted to free space and installed again finds its save there, no
++// iCloud and no picking. The group is the first of embedded.mobileprovision's application-groups; nil without one.
++static NSString *dm_group_saves_path(void) {
++    static NSString *cached; static BOOL done;
++    if (done) return cached;
++    done = YES;
++    NSData *d = [NSData dataWithContentsOfFile:[NSBundle.mainBundle pathForResource:@"embedded" ofType:@"mobileprovision"]];
++    if (!d) return nil;
++    NSRange a = [d rangeOfData:[@"<?xml" dataUsingEncoding:NSASCIIStringEncoding] options:0 range:NSMakeRange(0, d.length)];
++    NSRange b = [d rangeOfData:[@"</plist>" dataUsingEncoding:NSASCIIStringEncoding] options:0 range:NSMakeRange(0, d.length)];
++    if (a.location == NSNotFound || b.location == NSNotFound || b.location < a.location) return nil;
++    NSDictionary *plist = [NSPropertyListSerialization propertyListWithData:[d subdataWithRange:NSMakeRange(a.location, NSMaxRange(b) - a.location)]
++                                                                    options:0 format:nil error:nil];
++    NSArray *groups = [plist[@"Entitlements"][@"com.apple.security.application-groups"] isKindOfClass:NSArray.class] ? plist[@"Entitlements"][@"com.apple.security.application-groups"] : nil;
++    groups = [groups sortedArrayUsingSelector:@selector(compare:)];
++    for (NSString *g in groups) {
++        NSURL *u = [NSFileManager.defaultManager containerURLForSecurityApplicationGroupIdentifier:g];
++        if (!u) continue;
++        NSURL *dir = [u URLByAppendingPathComponent:@"nxnative Saves" isDirectory:YES];
++        [NSFileManager.defaultManager createDirectoryAtURL:dir withIntermediateDirectories:YES attributes:nil error:nil];
++        cached = dir.path;
++        break;
++    }
++    return cached;
++}
++
+ void dm_cloud_saves_env(void) {
+     static BOOL fromPick;   // DM_SAVE_SYNC is the one this set, not an env file's
+     if (getenv("DM_SAVE_SYNC") && !fromPick) return;
+@@ -73,5 +100,8 @@ void dm_cloud_saves_env(void) {
+     if (folder.length) {
+         setenv("DM_SAVE_SYNC", folder.fileSystemRepresentation, 1); fromPick = YES;
+         fprintf(stderr, "boot: cloud saves through %s\n", folder.fileSystemRepresentation);
++    } else if (dm_group_saves_path().length) {   // no picked folder: the app group's shared folder
++        setenv("DM_SAVE_SYNC", dm_group_saves_path().fileSystemRepresentation, 1); fromPick = YES;
++        fprintf(stderr, "boot: cloud saves through the app group folder %s\n", dm_group_saves_path().fileSystemRepresentation);
+     } else if (fromPick) { unsetenv("DM_SAVE_SYNC"); fromPick = NO; }
+ }
