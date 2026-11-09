@@ -1,0 +1,13 @@
+diff --git a/dm/ios/tools/gen_build.py b/dm/ios/tools/gen_build.py
+index 66a9d8b..e4e6a4e 100644
+--- a/dm/ios/tools/gen_build.py
++++ b/dm/ios/tools/gen_build.py
+@@ -41,4 +41,7 @@ for s in srcs:
+     os.symlink(s, f'{gen}/src/{flat}')
+ print('HEADER_SEARCH_PATHS = $(inherited) ' + ' '.join(f'"{d}"' for d in incs + dirs))
+ print('OTHER_CFLAGS = $(inherited) ' + ' '.join(defs))
+-print('DM_FRAMEWORKS = ' + ' '.join(f'-framework {f}' for f in fws if f != 'Cocoa'))
++# Mac-only frameworks the host links (IOBluetooth: pad_switch2_apple.m's host address, behind TARGET_OS_OSX) do not exist in the iOS SDK: the link failed with
++# "framework 'IOBluetooth' not found" once a342d640 added it to dm/host/Makefile
++MAC_ONLY = {'Cocoa', 'AppKit', 'Carbon', 'IOBluetooth'}
++print('DM_FRAMEWORKS = ' + ' '.join(f'-framework {f}' for f in fws if f not in MAC_ONLY))
