@@ -4,7 +4,7 @@
 # 동작:
 #   s3://nintendo-games-417178828989/uploads/ 를 정리합니다.
 #     1) *.url (링크 포인터): 링크에서 파일을 내려받고,
-#        rar/7z 이면 7-Zip(7zz, RAR5 지원)으로 .nsp/.xci/.nsz/.xcz 를 꺼내 올림.
+#        rar/7z 이면 7-Zip(7zz, RAR5 지원)으로 .nsp/.xci/.nsz/.xcz/.nup(Switch 2) 를 꺼내 올림.
 #        그 외(zip·게임파일)는 그대로 올림. 성공 시 .url 삭제.
 #     2) 버킷에 남은 *.rar / *.7z (직접 업로드분·과거분): 내려받아 풀고
 #        게임 파일로 올린 뒤 원본 압축 삭제.
@@ -73,8 +73,15 @@ jobs:
         run: |
           set -uo pipefail
           B="$S3_BUCKET"; P="$PREFIX"
-          work="$RUNNER_TEMP/relay"; mkdir -p "$work"
-          GAME='-iname *.nsp -o -iname *.xci -o -iname *.nsz -o -iname *.xcz'
+          # 큰 게임(Switch 2 NUP 20GB+)은 압축본과 푼 파일을 함께 들고 있어야 하므로 여유가 더 큰 디스크(/mnt 등)에서 작업한다
+          wbase="$RUNNER_TEMP"
+          if [ -d /mnt ] && sudo mkdir -p /mnt/relay-work && sudo chown "$(id -u):$(id -g)" /mnt/relay-work; then
+            a_tmp=$(df -B1 --output=avail "$RUNNER_TEMP" | tail -1); a_mnt=$(df -B1 --output=avail /mnt/relay-work | tail -1)
+            [ "$a_mnt" -gt "$a_tmp" ] && wbase=/mnt/relay-work
+          fi
+          work="$wbase/relay"; mkdir -p "$work"
+          echo "작업 폴더: $work"; df -h "$work"
+          GAME='-iname *.nsp -o -iname *.xci -o -iname *.nsz -o -iname *.xcz -o -iname *.nup'
 
           # 진행 상태를 s3://<버킷>/site/relay.json 에 남긴다(업로드 사이트가 막대로 보여 준다)
           cat > "$RUNNER_TEMP/rep.py" <<'PY'
@@ -128,6 +135,8 @@ jobs:
                   7za x -y -oext "$f" >&2 && ok=1
                 fi
                 if [ "$ok" = 1 ]; then
+                  rm -f "$f"   # 다 풀었으면 압축본은 지워 디스크를 비운다
+                  df -h . >&2
                   while IFS= read -r -d '' g; do
                     echo "업로드: $(basename "$g")" >&2
                     rep running "버킷에 올리는 중" "$(basename "$g")" 0 "$(stat -c%s "$g")" "$(date +%s)"
@@ -226,7 +235,7 @@ jobs:
           listing="$(aws s3api list-objects-v2 --bucket "$S3_BUCKET" --prefix "$PREFIX" --output json)"
           left=$(printf '%s' "$listing" | jq '[(.Contents // [])[].Key | select(test("\\.(url|rar|7z)$"; "i"))] | length')
           if [ "$left" != "0" ]; then echo "아직 받을 링크·압축 ${left}개 — 다 받은 뒤 시작"; exit 0; fi
-          games=$(printf '%s' "$listing" | jq '[(.Contents // [])[].Key | select(test("\\.(nsp|xci|nsz|xcz|zip)$"; "i"))] | length')
+          games=$(printf '%s' "$listing" | jq '[(.Contents // [])[].Key | select(test("\\.(nsp|xci|nsz|xcz|nup|zip)$"; "i"))] | length')
           if [ "$games" = "0" ]; then
             echo "::warning::빌드할 게임 파일이 없어 자동 빌드 예약을 취소합니다"
             aws s3 rm "s3://$S3_BUCKET/site/autobuild.json"; exit 0
