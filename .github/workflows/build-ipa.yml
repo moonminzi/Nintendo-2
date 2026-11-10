@@ -8,7 +8,7 @@
 # 기본 동작: 버킷의 uploads/ 에 있는 게임 파일을 전부 받아서 빌드합니다
 #            (업로드 사이트에서 올리거나 링크로 추가한 것들).
 # 특정 링크 하나만 빌드하려면 실행 시 "game_url" 입력칸에 직접 링크를 넣으면 됩니다(버킷 대신 그 링크 사용).
-# 게임 파일 형식: .nsp/.xci/.nsz/.xcz (또는 그것들을 담은 .zip / .rar / .7z)
+# 게임 파일 형식: .nsp/.xci/.nsz/.xcz, Switch 2 게임은 .nup (또는 그것들을 담은 .zip / .rar / .7z)
 # 그런 다음 Actions → "Build IPA" → Run workflow.
 #
 # 주의: 공개 저장소에서는 로그와 아티팩트(IPA)를 다른 사람도 볼 수 있습니다. 저장소를 Private로 바꾼 뒤 실행하세요.
@@ -219,11 +219,11 @@ jobs:
           done
 
           # 하위 폴더의 게임 파일을 최상위로
-          find . -mindepth 2 -type f \( -iname '*.nsp' -o -iname '*.xci' -o -iname '*.nsz' -o -iname '*.xcz' \) -exec mv {} . \;
+          find . -mindepth 2 -type f \( -iname '*.nsp' -o -iname '*.xci' -o -iname '*.nsz' -o -iname '*.xcz' -o -iname '*.nup' \) -exec mv {} . \;
 
           # 빌드 대상 확인
-          games=(*.nsp *.xci *.nsz *.xcz)
-          [ ${#games[@]} -gt 0 ] || { echo "::error::빌드할 게임 파일(.nsp/.xci/.nsz/.xcz)이 없습니다 (버킷 uploads/ 가 비었거나 링크가 잘못됨)"; exit 1; }
+          games=(*.nsp *.xci *.nsz *.xcz *.nup)
+          [ ${#games[@]} -gt 0 ] || { echo "::error::빌드할 게임 파일(.nsp/.xci/.nsz/.xcz/.nup)이 없습니다 (버킷 uploads/ 가 비었거나 링크가 잘못됨)"; exit 1; }
           echo "빌드 대상:"; printf ' - %s\n' "${games[@]}"
           df -h /
 
