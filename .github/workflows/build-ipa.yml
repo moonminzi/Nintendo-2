@@ -1,4 +1,8 @@
-# nxnative(https://github.com/seedds/nxnative)로 본인 소유 게임의 IPA를 GitHub macOS 러너에서 빌드합니다.
+# nxnative(https://github.com/seedds/nxnative)로 본인 소유 게임의 IPA(iPhone·iPad)와
+# Apple Silicon Mac용 네이티브 앱(.app)을 GitHub macOS 러너에서 빌드합니다.
+#   platform = ios      → IPA만 (기본)
+#   platform = mac-app  → Mac 앱만: s3://<버킷>/ipa/ipa-<번호>/mac/<이름>.app.zip + 릴리스 mac-<번호>
+#   platform = both     → IPA를 먼저 만들어 올린 뒤 Mac 앱까지
 #
 # 준비물 (Settings → Secrets and variables → Actions → New repository secret):
 #   PROD_KEYS : 본인 기기에서 뽑은 prod.keys 파일 내용 전체 (텍스트 그대로 붙여넣기)
@@ -17,6 +21,11 @@ name: Build IPA
 on:
   workflow_dispatch:
     inputs:
+      platform:
+        description: "ios = iPhone·iPad IPA, mac-app = Apple Silicon Mac 앱(.app), both = 둘 다"
+        type: choice
+        options: [ios, mac-app, both]
+        default: ios
       game_url:
         description: "특정 링크만 빌드할 때 입력(.nsp/.xci/.nsz/.xcz 또는 .zip/.rar/.7z). 비우면 버킷 uploads/ 의 파일 전부로 빌드"
         default: ""
@@ -24,7 +33,7 @@ on:
         description: nxnative 브랜치/태그/커밋
         default: main
       romfs:
-        description: "bundle = 게임 데이터를 IPA에 포함, separate = 제외(IPA가 작아짐)"
+        description: "(IPA만 해당) bundle = 게임 데이터를 IPA에 포함, separate = 제외(IPA가 작아짐). Mac 앱은 항상 포함"
         type: choice
         options: [bundle, separate]
         default: bundle
@@ -35,8 +44,11 @@ on:
         description: 러너의 Xcode가 27.2가 아닐 때도 셰이더 빌드 진행 (--allow-other-metal)
         type: boolean
         default: true
+      mac_gpu:
+        description: "(Mac 앱) 미리 만들어 넣을 파이프라인 캐시의 GPU (예 g14s = M2 Max). none = 첫 실행 때 Mac이 직접 만듦(러너 GPU는 실제 Mac과 달라 기본 none)"
+        default: none
       auto_sign:
-        description: 빌드가 끝나면 nago-sign 서명기로 바로 서명 시작
+        description: (IPA만 해당) 빌드가 끝나면 nago-sign 서명기로 바로 서명 시작
         type: boolean
         default: true
       sign_cert:
@@ -94,6 +106,7 @@ jobs:
         env:
           IN_ROMFS: ${{ inputs.romfs }}
           IN_LANG: ${{ inputs.language }}
+          IN_PLATFORM: ${{ inputs.platform }}
         run: |
           cat > "$RUNNER_TEMP/st.py" <<'PY'
           import json, os, re, subprocess, sys, time
@@ -104,7 +117,8 @@ jobs:
               rid = os.environ["GITHUB_RUN_ID"]
               s = {"run_id": rid, "run_number": int(os.environ["GITHUB_RUN_NUMBER"]),
                    "url": "%s/%s/actions/runs/%s" % (os.environ["GITHUB_SERVER_URL"], os.environ["GITHUB_REPOSITORY"], rid),
-                   "started": time.time(), "romfs": os.environ.get("IN_ROMFS", ""), "language": os.environ.get("IN_LANG", "")}
+                   "started": time.time(), "romfs": os.environ.get("IN_ROMFS", ""), "language": os.environ.get("IN_LANG", ""),
+                   "platform": os.environ.get("IN_PLATFORM", "ios")}
           a = sys.argv[1:]
           if a and a[0] != "-":
               s["state"] = a[0]
@@ -150,7 +164,7 @@ jobs:
           xcodebuild -version
           # Metal 툴체인/iOS 플랫폼 준비(버전 불일치는 --allow-other-metal로 넘어가므로 실패해도 계속)
           xcodebuild -downloadComponent MetalToolchain || true
-          xcodebuild -downloadPlatform iOS || true
+          [ "${{ inputs.platform }}" = "mac-app" ] || xcodebuild -downloadPlatform iOS || true
           xcrun -sdk iphoneos metal --version || true
           df -h /
 
@@ -228,6 +242,7 @@ jobs:
           df -h /
 
       - name: IPA 빌드
+        if: inputs.platform != 'mac-app'
         run: |
           set -o pipefail
           python3 "$RUNNER_TEMP/st.py" running "IPA 빌드 중 (nxnative)"
@@ -250,22 +265,21 @@ jobs:
           find "$RUNNER_TEMP/game" -maxdepth 1 -name '*.ipa' -exec mv {} "$RUNNER_TEMP/out/" \;
           ls -la "$RUNNER_TEMP/out"
 
-      - name: 키 삭제
-        if: always()
-        run: rm -rf "$RUNNER_TEMP/keys"
-
       # archive: false → zip으로 묶지 않고 .ipa 파일 그대로 올린다(내려받으면 바로 .ipa, 아티팩트 이름 = 파일명)
       # IPA는 크기와 상관없이 항상 S3 ipa/<태그>/ 에 올린다(업로드 사이트·서명기가 여기서 집어 간다).
       # GitHub 릴리스 첨부는 2GiB 미만만 허용되므로, 그 이상이면 릴리스에는 7일짜리 다운로드 링크를 넣는다.
       - name: IPA 올리기 · 릴리스 · 자동 서명
-        if: success()
+        if: success() && inputs.platform != 'mac-app'
         env:
+          PLATFORM: ${{ inputs.platform }}
           GH_TOKEN: ${{ github.token }}
           AUTO_SIGN: ${{ inputs.auto_sign }}
           SIGN_CERT: ${{ inputs.sign_cert }}
           ROMFS: ${{ inputs.romfs }}
         run: |
           set -euo pipefail
+          # both 면 이어서 Mac 앱을 만들므로 여기서는 '완료'로 표시하지 않는다
+          fin=done; [ "$PLATFORM" = "both" ] && fin=running
           ipa=$(ls "$RUNNER_TEMP"/out/*.ipa 2>/dev/null | head -1)
           [ -n "$ipa" ] || { echo "::error::발행할 IPA가 없습니다"; exit 1; }
           name=$(basename "$ipa")
@@ -308,7 +322,7 @@ jobs:
             || echo "::warning::릴리스 발행 실패(IPA는 S3에 올라가 있음)"
 
           if [ "$AUTO_SIGN" != "true" ]; then
-            python3 "$RUNNER_TEMP/st.py" done "빌드 완료"
+            python3 "$RUNNER_TEMP/st.py" "$fin" "빌드 완료"
             exit 0
           fi
           python3 "$RUNNER_TEMP/st.py" running "서명 요청 중"
@@ -322,10 +336,10 @@ jobs:
             c="${SIGN_CERT:-0}"; case "$c" in *[!0-9]*|"") c=0 ;; esac
             printf '{"job": "%s", "key": "%s", "by": "build", "cert": %s}' "$job" "$key" "$c" \
               | aws s3 cp - "s3://$S3_BUCKET/site/sign/${tag}.json" --content-type application/json
-            python3 "$RUNNER_TEMP/st.py" done "빌드 완료 · 서명 진행 중" "sign_job=$job"
+            python3 "$RUNNER_TEMP/st.py" "$fin" "빌드 완료 · 서명 진행 중" "sign_job=$job"
           else
             echo "::warning::자동 서명 요청 실패: $(cat "$RUNNER_TEMP/sign.json" 2>/dev/null || true)"
-            python3 "$RUNNER_TEMP/st.py" done "빌드 완료 (자동 서명 실패 — 사이트에서 서명을 누르세요)"
+            python3 "$RUNNER_TEMP/st.py" "$fin" "빌드 완료 (자동 서명 실패 — 사이트에서 서명을 누르세요)"
           fi
 
       - name: 게임 데이터 패치 만들기 (patch.zip)
@@ -350,6 +364,82 @@ jobs:
           ls -la "$w/patch-out.zip"
           aws s3 cp "$w/patch-out.zip" "s3://$S3_BUCKET/ipa/ipa-${{ github.run_number }}/patch.zip" --no-progress
           python3 "$RUNNER_TEMP/st.py" - "한국어 패치 올림"
+
+      # Apple Silicon Mac 앱: nxnative --platform mac-app (Mac 셰이더 + Mac 호스트 + 런처를 담은 더블클릭용 .app).
+      # 게임 데이터는 앱 안에 들어가고(--romfs separate 불가), 추출본은 nxnative가 항상 남긴다.
+      - name: Mac 앱 빌드 (Apple Silicon)
+        if: inputs.platform != 'ios'
+        env:
+          MAC_GPU: ${{ inputs.mac_gpu }}
+        run: |
+          set -o pipefail
+          python3 "$RUNNER_TEMP/st.py" running "Mac 앱 빌드 중 (nxnative)"
+          # both: IPA는 이미 S3에 있으니 디스크를 비워 둔다
+          rm -f "$RUNNER_TEMP"/out/*.ipa
+          args=(--platform mac-app --progress lines --gpu "${MAC_GPU:-none}")
+          [ -n "${{ inputs.language }}" ] && args+=(-l "${{ inputs.language }}")
+          [ "${{ inputs.allow_other_metal }}" = "true" ] && args+=(--allow-other-metal)
+          mkdir -p "$RUNNER_TEMP/out/mac"
+          log="$RUNNER_TEMP/build-mac.log"; : > "$log"
+          ( while sleep 20; do python3 "$RUNNER_TEMP/st.py" - - "logfile=$log"; done ) &
+          tailer=$!
+          rc=0
+          "$RUNNER_TEMP/venv/bin/python" -u nxnative/scripts/build_ipa_from_nsp.py "$RUNNER_TEMP/game" \
+            -k "$RUNNER_TEMP/keys/prod.keys" "${args[@]}" 2>&1 | tee "$log" || rc=$?
+          kill "$tailer" 2>/dev/null || true
+          python3 "$RUNNER_TEMP/st.py" - - "logfile=$log"
+          [ "$rc" -eq 0 ] || exit "$rc"
+          find "$RUNNER_TEMP/game" -maxdepth 1 -name '*.app' -type d -exec mv {} "$RUNNER_TEMP/out/mac/" \;
+          ls -la "$RUNNER_TEMP/out/mac"
+
+      # .app 은 폴더라 그대로 올릴 수 없어 ditto 로 zip(서명·심볼릭 링크·권한 유지)한다. Finder에서 더블클릭하면 풀린다.
+      - name: Mac 앱 올리기 · 릴리스
+        if: success() && inputs.platform != 'ios'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          app=$(find "$RUNNER_TEMP/out/mac" -maxdepth 1 -name '*.app' -type d | head -1)
+          [ -n "$app" ] || { echo "::error::만들어진 Mac 앱(.app)이 없습니다"; exit 1; }
+          base=$(basename "$app" .app)
+          safe=$(printf '%s' "$base" | LC_ALL=C tr -cd 'A-Za-z0-9._-'); [ -n "$safe" ] || safe=game
+          zip="$RUNNER_TEMP/out/${safe}.app.zip"
+          python3 "$RUNNER_TEMP/st.py" running "Mac 앱 압축 중"
+          ditto -c -k --keepParent "$app" "$zip"
+          rm -rf "$app"
+          size=$(stat -f%z "$zip")
+          key="ipa/ipa-${GITHUB_RUN_NUMBER}/mac/${safe}.app.zip"
+          python3 "$RUNNER_TEMP/st.py" running "Mac 앱 올리는 중 ($(( size / 1024 / 1024 )) MB)"
+          aws s3 cp "$zip" "s3://$S3_BUCKET/$key" --no-progress
+          python3 "$RUNNER_TEMP/st.py" - - "mac_key=$key"
+
+          tag="mac-${GITHUB_RUN_NUMBER}"
+          notes="Apple Silicon(M1 이후) Mac용 앱입니다. 압축을 풀어 ${base}.app 을 응용 프로그램 폴더로 옮기세요.
+          개발자 서명이 없어(ad-hoc) 처음 열 때 macOS가 막습니다. 아래 둘 중 하나로 여세요.
+            - 시스템 설정 → 개인정보 보호 및 보안 → '그래도 열기'
+            - 터미널: xattr -dr com.apple.quarantine \"/Applications/${base}.app\"
+          세이브: ~/Library/Application Support/nxnative/<타이틀 ID>/, 로그: ~/Library/Logs/nxnative/"
+          if [ "$size" -lt 2147483648 ]; then
+            assets=("$zip")
+          else
+            url=$(aws s3 presign "s3://$S3_BUCKET/$key" --expires-in 604800)
+            printf '%s\n' "$url" > "$RUNNER_TEMP/mac-download-url.txt"
+            assets=("$RUNNER_TEMP/mac-download-url.txt")
+            notes="${notes}
+
+          앱 크기가 $(( size / 1024 / 1024 )) MB로 GitHub 릴리스 한도(2GB)를 넘어 S3에 올렸습니다.
+          다운로드 링크(7일 유효): ${url}"
+          fi
+          gh release create "$tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY" \
+            --title "Nintendo Mac app ${tag}" --notes "$notes" \
+            || gh release upload "$tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber \
+            || echo "::warning::릴리스 발행 실패(Mac 앱은 S3에 올라가 있음)"
+          python3 "$RUNNER_TEMP/st.py" done "빌드 완료 ($([ "${{ inputs.platform }}" = both ] && echo 'IPA·Mac 앱' || echo 'Mac 앱'))"
+
+      # prod.keys 는 Mac 앱 빌드까지 쓰므로 모든 빌드가 끝난 뒤 지운다
+      - name: 키 삭제
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/keys"
 
       - name: 빌드 상태 마무리 (실패·취소)
         if: failure() || cancelled()
