@@ -47,6 +47,10 @@ on:
       mac_gpu:
         description: "(Mac 앱) 미리 만들어 넣을 파이프라인 캐시의 GPU (예 g14s = M2 Max). none = 첫 실행 때 Mac이 직접 만듦(러너 GPU는 실제 Mac과 달라 기본 none)"
         default: none
+      mac_seen_shaders:
+        description: "(Mac 앱) 플레이 테스트에서 쓰인 셰이더만 빌드(몇 분, 디스크 적게). 목록에 없는 장면은 일부가 안 그려질 수 있음. 끄면 전체(몇 시간)"
+        type: boolean
+        default: false
       auto_sign:
         description: (IPA만 해당) 빌드가 끝나면 nago-sign 서명기로 바로 서명 시작
         type: boolean
@@ -148,7 +152,9 @@ jobs:
           ls -d /Applications/Xcode*.app || true
           sudo rm -rf "$HOME/Library/Android" /usr/local/share/dotnet/sdk-manifests/*/microsoft.net.sdk.android* 2>/dev/null || true
           xcrun simctl delete all 2>/dev/null || true
-          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* 2>/dev/null || true
+          # 시뮬레이터 런타임 디스크 이미지(iOS·watchOS·tvOS·visionOS 한 벌에 수 GB)는 Images/ 에 있어 Profiles 만 지우면 남는다
+          xcrun simctl runtime delete all 2>/dev/null || true
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* /Library/Developer/CoreSimulator/Images/* 2>/dev/null || true
           # 큰 게임(25GB+)은 원본 + 추출본(RomFS 크기 + 6GB) + 결과물로 80GB 가까이 필요하다.
           # 빌드에 안 쓰는 도구 캐시·브라우저·언어 툴체인을 지운다(python3·aws·brew·dotnet은 건드리지 않음)
           tc="${RUNNER_TOOL_CACHE:-$HOME/hostedtoolcache}"
@@ -159,7 +165,12 @@ jobs:
                    "/Applications/Google Chrome.app" "/Applications/Google Chrome for Testing.app" \
                    /Applications/Firefox.app "/Applications/Microsoft Edge.app" \
                    /usr/local/share/powershell /usr/local/share/chromium /usr/local/share/edge_driver \
-                   /usr/local/share/chromedriver-* /usr/local/share/geckodriver; do
+                   /usr/local/share/chromedriver-* /usr/local/share/geckodriver \
+                   /Library/Developer/Toolchains "$HOME/.swiftly" "$HOME/Library/Developer/Toolchains" \
+                   /Library/Frameworks/Mono.framework /Library/Frameworks/Xamarin.iOS.framework \
+                   /Library/Frameworks/Xamarin.Mac.framework /Library/Frameworks/Xamarin.Android.framework \
+                   /usr/local/miniconda /usr/local/lib/android "/Applications/Visual Studio Code.app" \
+                   /Applications/Android\ Studio.app "$HOME/Library/Caches/Homebrew" "$HOME/.npm" "$HOME/.cache"; do
             [ -e "$p" ] || continue
             echo "삭제: $p ($(sudo du -sh "$p" 2>/dev/null | cut -f1))"
             sudo rm -rf "$p" &
@@ -271,6 +282,29 @@ jobs:
           [ ${#games[@]} -gt 0 ] || { echo "::error::빌드할 게임 파일(.nsp/.xci/.nsz/.xcz/.nup)이 없습니다 (버킷 uploads/ 가 비었거나 링크가 잘못됨)"; exit 1; }
           echo "빌드 대상:"; printf ' - %s\n' "${games[@]}"
           df -h /
+
+          # 공간 미리 확인: 빌드 중에는 원본과 추출본(RomFS.img, 원본과 비슷한 크기)이 같이 있고, 그 위에 셰이더가 쌓인다.
+          # nxnative 자체 확인은 RomFS + 6GB 뿐이라 Mac 셰이더 전체 빌드(4만 개 넘음)는 몇 시간 돌고 나서야 공간 부족으로 실패한다
+          # (run #24: 추출 뒤 약 18GB 남은 상태에서 2시간 39분 컴파일 후 셰이더 라이브러리를 쓰다 실패). 그래서 시작 전에 막는다.
+          game_gb=$(du -ck "${games[@]}" | tail -1 | awk '{printf "%d", $1/1048576 + 0.999}')
+          free_gb=$(df -k . | awk 'NR==2 {printf "%d", $4/1048576}')
+          case "${{ inputs.platform }}/${{ inputs.mac_seen_shaders }}" in
+            ios/*)       margin=10 ;;   # IPA: 추출본은 빌드 뒤 지우고(--no-keep-extracted) iOS 셰이더만
+            */true)      margin=10 ;;   # Mac 앱, 쓰인 셰이더만
+            *)           margin=25 ;;   # Mac 앱, 셰이더 전체
+          esac
+          need_gb=$(( game_gb + margin ))
+          echo "공간: 게임 ${game_gb}GB + 추출본·셰이더 여유 ${margin}GB = 약 ${need_gb}GB 필요, ${free_gb}GB 남음"
+          if [ "$free_gb" -lt "$need_gb" ]; then
+            msg="디스크 공간 부족 예상: 약 ${need_gb}GB 필요(게임 ${game_gb}GB ×2 정도 + 셰이더), ${free_gb}GB 남음."
+            if [ "${{ inputs.platform }}" = ios ]; then
+              echo "::warning::$msg 그래도 IPA 빌드는 시도합니다."
+            else
+              echo "::error::$msg Mac 셰이더 전체 빌드는 몇 시간 뒤 실패하므로 지금 멈춥니다. mac_seen_shaders 를 켜고 다시 실행하세요."
+              python3 "$RUNNER_TEMP/st.py" failure "디스크 공간 부족 (${free_gb}GB / 필요 ${need_gb}GB)" || true
+              exit 1
+            fi
+          fi
 
       - name: IPA 빌드
         if: inputs.platform != 'mac-app'
@@ -410,6 +444,7 @@ jobs:
           args=(--platform mac-app --progress lines --gpu "${MAC_GPU:-none}")
           [ -n "${{ inputs.language }}" ] && args+=(-l "${{ inputs.language }}")
           [ "${{ inputs.allow_other_metal }}" = "true" ] && args+=(--allow-other-metal)
+          [ "${{ inputs.mac_seen_shaders }}" = "true" ] && args+=(--seen-shaders)
           mkdir -p "$RUNNER_TEMP/out/mac"
           log="$RUNNER_TEMP/build-mac.log"; : > "$log"
           ( while sleep 20; do python3 "$RUNNER_TEMP/st.py" - - "logfile=$log"; done ) &
