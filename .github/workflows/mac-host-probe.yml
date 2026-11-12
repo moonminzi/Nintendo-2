@@ -1,0 +1,65 @@
+# EC2 Mac 대여 가능 여부 조회 (읽기 전용: 아무것도 만들거나 빌리지 않는다)
+# 저장소 AWS 키의 권한, 리전별 Mac 호스트 쿼터·신청 기록, 빌릴 수 있는 Mac 모델과 가용 영역, 시간당 가격, 이미 잡힌 호스트를 출력한다.
+name: Mac host probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ccr-23ade2e1-5piuly]
+    paths: [.github/workflows/mac-host-probe.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: AWS 자격증명 설정
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: 조회
+        run: |
+          echo "== 키 주인"
+          aws sts get-caller-identity --query Arn --output text || true
+          for r in ap-northeast-2 ap-northeast-1 us-east-1 us-west-2; do
+            echo; echo "################ $r"
+            echo "== 빌릴 수 있는 Mac 모델 (가용 영역)"
+            aws ec2 describe-instance-type-offerings --region "$r" --location-type availability-zone \
+              --filters 'Name=instance-type,Values=mac*' \
+              --query 'InstanceTypeOfferings[].[InstanceType,Location]' --output text 2>&1 | sort || true
+            echo "== Mac 호스트 쿼터 (0 이면 아직 못 빌림)"
+            aws service-quotas list-service-quotas --region "$r" --service-code ec2 \
+              --query "Quotas[?contains(QuotaName, 'mac')].[QuotaName,Value]" --output text 2>&1 || true
+            echo "== 쿼터 신청 기록"
+            aws service-quotas list-requested-service-quota-change-history --region "$r" --service-code ec2 \
+              --query "RequestedQuotas[?contains(QuotaName, 'mac')].[QuotaName,DesiredValue,Status,Created]" --output text 2>&1 || true
+            echo "== 이미 잡혀 있는 Dedicated Host"
+            aws ec2 describe-hosts --region "$r" \
+              --query 'Hosts[].[HostId,HostProperties.InstanceType,State,AvailabilityZone,AllocationTime]' --output text 2>&1 || true
+          done
+
+          echo; echo "################ 시간당 가격 (Dedicated Host, On-Demand)"
+          for loc in "Asia Pacific (Seoul)" "Asia Pacific (Tokyo)" "US East (N. Virginia)"; do
+            for t in mac-m4.metal mac-m4pro.metal mac-m4max.metal mac-m3ultra.metal mac2-m2pro.metal; do
+              p=$(aws pricing get-products --region us-east-1 --service-code AmazonEC2 \
+                --filters "Type=TERM_MATCH,Field=instanceType,Value=$t" "Type=TERM_MATCH,Field=location,Value=$loc" \
+                          "Type=TERM_MATCH,Field=tenancy,Value=Host" \
+                --query 'PriceList[]' --output json 2>/dev/null \
+                | python3 -c 'import json,sys
+          out=set()
+          for s in json.load(sys.stdin):
+              d=json.loads(s); a=d["product"]["attributes"]
+              for t in d.get("terms",{}).get("OnDemand",{}).values():
+                  for pd in t["priceDimensions"].values():
+                      v=float(pd["pricePerUnit"].get("USD",0))
+                      if v>0: out.add("%.3f USD/%s (%s vCPU, %s)"%(v,pd["unit"],a.get("vcpu","?"),a.get("memory","?")))
+          print("; ".join(sorted(out)) or "-")' 2>&1)
+              echo "$loc  $t  $p"
+            done
+          done
