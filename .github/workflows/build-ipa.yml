@@ -149,6 +149,22 @@ jobs:
           sudo rm -rf "$HOME/Library/Android" /usr/local/share/dotnet/sdk-manifests/*/microsoft.net.sdk.android* 2>/dev/null || true
           xcrun simctl delete all 2>/dev/null || true
           sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* 2>/dev/null || true
+          # 큰 게임(25GB+)은 원본 + 추출본(RomFS 크기 + 6GB) + 결과물로 80GB 가까이 필요하다.
+          # 빌드에 안 쓰는 도구 캐시·브라우저·언어 툴체인을 지운다(python3·aws·brew·dotnet은 건드리지 않음)
+          tc="${RUNNER_TOOL_CACHE:-$HOME/hostedtoolcache}"
+          for p in "$tc"/CodeQL "$tc"/go "$tc"/node "$tc"/Ruby "$tc"/PyPy "$tc"/Java_* \
+                   "$HOME/.rustup" "$HOME/.cargo" "$HOME/.ghcup" "$HOME/.gradle" "$HOME/.m2" \
+                   "$HOME/Library/Developer/Xcode/DerivedData" "$HOME/Library/Developer/CoreSimulator" \
+                   /Library/Developer/CoreSimulator/Caches \
+                   "/Applications/Google Chrome.app" "/Applications/Google Chrome for Testing.app" \
+                   /Applications/Firefox.app "/Applications/Microsoft Edge.app" \
+                   /usr/local/share/powershell /usr/local/share/chromium /usr/local/share/edge_driver \
+                   /usr/local/share/chromedriver-* /usr/local/share/geckodriver; do
+            [ -e "$p" ] || continue
+            echo "삭제: $p ($(sudo du -sh "$p" 2>/dev/null | cut -f1))"
+            sudo rm -rf "$p" &
+          done
+          wait
           df -h /
 
       - name: Xcode 선택 (27.x 우선)
@@ -159,8 +175,19 @@ jobs:
           [ -n "$pick" ] || pick=$(ls -d /Applications/Xcode_*.app 2>/dev/null | grep -v beta | sort -V | tail -1)
           [ -n "$pick" ] || pick=/Applications/Xcode.app
           echo "selected: $pick"
-          # 다른 Xcode는 지우지 않는다(디스크 100GB+ 여유, 심링크 짝을 지우면 선택본이 깨짐)
           sudo xcode-select -s "$pick/Contents/Developer"
+          xcodebuild -version
+          # 안 쓰는 Xcode(한 벌에 10GB 이상)를 지운다. 선택본과 DEVELOPER_DIR의 실제 폴더,
+          # 그리고 그 폴더를 가리키는 심링크(Xcode_27.2.app → Xcode_27.2.0.app 같은 짝)는 남긴다
+          keep1=$(cd "$pick" && pwd -P)
+          keep2=$(cd "${DEVELOPER_DIR%/Contents/Developer}" 2>/dev/null && pwd -P || echo "$keep1")
+          for x in /Applications/Xcode*.app; do
+            real=$(cd "$x" 2>/dev/null && pwd -P || echo "$x")
+            [ "$real" = "$keep1" ] || [ "$real" = "$keep2" ] && continue
+            if [ -L "$x" ]; then sudo rm -f "$x"; else echo "삭제: $x ($(du -sh "$x" 2>/dev/null | cut -f1))"; sudo rm -rf "$x" & fi
+          done
+          wait
+          ls -ld /Applications/Xcode*.app
           xcodebuild -version
           # Metal 툴체인/iOS 플랫폼 준비(버전 불일치는 --allow-other-metal로 넘어가므로 실패해도 계속)
           xcodebuild -downloadComponent MetalToolchain || true
@@ -192,6 +219,10 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/pip" install -r nxnative/.github/requirements/tools.txt
           "$RUNNER_TEMP/venv/bin/pip" install "backports.zstd; python_version < '3.14'"
+          # 설치 파일 캐시 비우기(게임 받을 자리 확보)
+          brew cleanup -s >/dev/null 2>&1 || true
+          rm -rf "$(brew --cache)" "$HOME/Library/Caches/pip" 2>/dev/null || true
+          df -h /
 
       - name: 게임과 키 준비
         env:
