@@ -82,7 +82,8 @@ jobs:
   build:
     # aws-mac: EC2 Mac에 등록한 self-hosted 러너(라벨 mac-build). 그 Mac은 빌드 전용이라 디스크 정리·Xcode 삭제를 하지 않는다
     runs-on: ${{ inputs.runner == 'aws-mac' && fromJSON('["self-hosted","macOS","ARM64","mac-build"]') || 'xcode-27' }}
-    timeout-minutes: 360
+    # GitHub 러너는 6시간이 한도. 빌린 Mac은 IPA와 Mac 앱을 한 번에 만들 수 있게 20시간
+    timeout-minutes: ${{ inputs.runner == 'aws-mac' && 1200 || 360 }}
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
       S3_BUCKET: nintendo-games-417178828989
